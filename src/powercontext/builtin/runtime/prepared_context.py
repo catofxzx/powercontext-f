@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -46,6 +47,10 @@ _MIN_TRUNCATED_CONTENT_BYTES = 64
 _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
+_EVIDENCE_TOKEN = re.compile(r"[a-z]+|\d+")
+_EVIDENCE_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_EVIDENCE_MAX_SPANS = 4
+_EVIDENCE_MAX_SPAN_BYTES = 512
 _Item = TypeVar("_Item")
 
 
@@ -56,6 +61,7 @@ class _PreparedContextEntry:
     citation: dict[str, object]
     content: str
     truncated: bool
+    fragment: PreparedFragment | None = None
 
 
 @dataclass(frozen=True)
@@ -106,6 +112,17 @@ class PreparedContextBuild:
     origins: tuple[PreparedContextOrigin, ...]
     omissions: PreparedContextOmissions = PreparedContextOmissions()
     code_origins: tuple[CodeEvidenceRef, ...] = ()
+    fragments: tuple[PreparedFragment, ...] = ()
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedFragment:
+    """One exact slice of a Memory entry that answers the query."""
+
+    address: MemoryEntryAddress
+    start: int
+    end: int
+    text: str
 
 
 @dataclass(frozen=True)
@@ -235,7 +252,7 @@ class PreparedContextBuilder:
         if sum(len(candidates.hits) for candidates in experience_candidates) > self.experience_candidate_limit:
             raise PreparedContextInvariantError("experience-candidate-limit")
 
-        content, origins, omissions = self._select_entries(
+        content, origins, omissions, fragments = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
             memory_candidates=memory_candidates,
@@ -254,6 +271,7 @@ class PreparedContextBuilder:
             context=PreparedContext(status="ready", content=content, content_bytes=content_bytes),
             origins=origins,
             omissions=omissions,
+            fragments=fragments,
         )
 
     def probe_budget(
@@ -277,7 +295,7 @@ class PreparedContextBuilder:
         counters because both go through :meth:`_select_entries`.
         """
 
-        content, origins, omissions = self._select_entries(
+        content, origins, omissions, _fragments = self._select_entries(
             request=request,
             current_scope_id=current_scope_id,
             memory_candidates=memory_candidates,
@@ -303,11 +321,11 @@ class PreparedContextBuilder:
         topic_memory_hits: Sequence[TopicMemorySearchHit],
         experience_candidates: Sequence[PreparedExperienceCandidates],
         profile_candidates: Sequence[PreparedProfileCandidate],
-    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions]:
+    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions, tuple[PreparedFragment, ...]]:
         """Run one complete pure selection pass and render it.
 
-        Returns ``(content, origins, omissions)``; ``content`` is ``None`` exactly when nothing
-        was selected, which is the empty-result case for both paths. This is the single
+        Returns ``(content, origins, omissions, fragments)``; ``content`` is ``None`` exactly when
+        nothing was selected, which is the empty-result case for both paths. This is the single
         selection path shared by :meth:`build_scopes_result` and :meth:`probe_budget`, so the
         probe's counters always describe the selection the build would actually perform.
         """
@@ -321,6 +339,30 @@ class PreparedContextBuilder:
                 profile_candidates=profile_candidates,
                 topic_memory_hits=topic_memory_hits,
             )
+
+        if request.evidence_selection:
+            scope_id = ""
+            for candidates in memory_candidates:
+                scope_id = candidates.scope_id or current_scope_id or ""
+                break
+            if not scope_id:
+                raise PreparedContextInvariantError("evidence-scope-missing")
+            memory_entries = _interleave_groups(
+                tuple(
+                    self._evidence_entries(
+                        candidates.memory_ref,
+                        candidates.hits,
+                        scope_id=scope_id,
+                        query=request.query,
+                    )
+                    for candidates in memory_candidates
+                )
+            )
+            entries, omissions = self._fit_entries(request, memory_entries, (), ())
+            fragments = tuple(entry.fragment for entry in entries if entry.fragment is not None)
+            if not entries:
+                return None, (), omissions, fragments
+            return _render(entries), tuple(entry.origin for entry in entries), omissions, fragments
 
         memory_entries = _interleave_groups(
             tuple(
@@ -344,8 +386,8 @@ class PreparedContextBuilder:
         )[: self.experience_entry_limit]
         entries, omissions = self._fit_entries(request, memory_entries, topic_memory_entries, experience_entries)
         if not entries:
-            return None, (), omissions
-        return _render(entries), tuple(entry.origin for entry in entries), omissions
+            return None, (), omissions, ()
+        return _render(entries), tuple(entry.origin for entry in entries), omissions, ()
 
     def _select_text(
         self,
@@ -499,6 +541,72 @@ class PreparedContextBuilder:
             )
         return tuple(memory_entries)
 
+    def _evidence_entries(
+        self,
+        memory_ref: ArtifactRef | None,
+        hits: Sequence[MemoryHit],
+        *,
+        scope_id: str,
+        query: str,
+    ) -> tuple[_PreparedContextEntry, ...]:
+        """Select the exact text slices of the Memory entries that answer one query."""
+
+        terms = _query_terms(query)
+        if not terms:
+            return ()
+        if hits and memory_ref is None:
+            raise PreparedContextInvariantError("memory-ref-missing")
+        addresses: list[MemoryEntryAddress] = []
+        texts: list[str] = []
+        spans_per_hit: list[list[tuple[int, int]]] = []
+        seen: set[tuple[str, str]] = set()
+        for hit in hits:
+            if hit.memory_ref != memory_ref:
+                raise PreparedContextInvariantError("memory-ref-mismatch")
+            citation_key = (hit.entry_id, hit.entry_version_id)
+            if citation_key in seen:
+                continue
+            seen.add(citation_key)
+            if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
+                continue
+            addresses.append(
+                MemoryEntryAddress(
+                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                    entry_id=hit.entry_id,
+                    entry_version_id=hit.entry_version_id,
+                )
+            )
+            texts.append(hit.text)
+            spans_per_hit.append(_evidence_spans(hit.text, terms))
+        entries: list[_PreparedContextEntry] = []
+        for round_index in range(max((len(spans) for spans in spans_per_hit), default=0)):
+            for address, text, spans in zip(addresses, texts, spans_per_hit, strict=True):
+                if round_index >= len(spans):
+                    continue
+                start, end = spans[round_index]
+                fragment = PreparedFragment(
+                    address=address,
+                    start=start,
+                    end=end,
+                    text=text[start:end],
+                )
+                entries.append(
+                    _PreparedContextEntry(
+                        origin=address,
+                        kind="memory",
+                        citation={
+                            "scope_id": scope_id,
+                            "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                            "entry_id": address.entry_id,
+                            "entry_version_id": address.entry_version_id,
+                        },
+                        content=fragment.text,
+                        truncated=False,
+                        fragment=fragment,
+                    )
+                )
+        return tuple(entries)
+
     def _topic_memory_entries(
         self,
         hits: Sequence[TopicMemorySearchHit],
@@ -588,6 +696,7 @@ class PreparedContextBuilder:
                 kind=candidate.kind,
                 citation=candidate.citation,
                 text=candidate.content,
+                fragment=candidate.fragment,
                 max_bytes=request.max_bytes,
             )
             if fit.entry is None:
@@ -612,6 +721,7 @@ class PreparedContextBuilder:
         kind: str,
         citation: dict[str, object],
         text: str,
+        fragment: PreparedFragment | None = None,
         max_bytes: int,
     ) -> _EntryFit:
         """Fit one entry into the remaining budget, reporting why it was dropped if it was.
@@ -620,6 +730,19 @@ class PreparedContextBuilder:
         shorter rendering exists and fits but is too short to deliver honestly, while
         ``no-fitting-truncation`` means no shortened rendering fitted at all.
         """
+
+        if fragment is not None:
+            candidate = _PreparedContextEntry(
+                origin=origin,
+                kind=kind,
+                citation=citation,
+                content=text,
+                truncated=False,
+                fragment=fragment,
+            )
+            if _rendered_bytes((*entries, candidate)) <= max_bytes:
+                return _EntryFit(entry=candidate)
+            return _EntryFit(dropped_no_fitting_truncation=True)
 
         source_bytes = len(text.encode("utf-8"))
         entry_budget = min(source_bytes, self.max_entry_content_bytes)
@@ -709,12 +832,62 @@ def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
     raise PreparedContextInvariantError("text-scope-missing")
 
 
+def _query_terms(query: str) -> frozenset[str]:
+    """Return the lowercase word and number terms of one query."""
+
+    return frozenset(_EVIDENCE_TOKEN.findall(query.lower()))
+
+
+def _evidence_spans(text: str, terms: frozenset[str], /) -> list[tuple[int, int]]:
+    """Return the character spans of the text that carry the query terms."""
+
+    if not terms:
+        return []
+    scored: list[tuple[int, int, int, int]] = []
+    for index, (start, end) in enumerate(_evidence_segments(text)):
+        tokens = set(_EVIDENCE_TOKEN.findall(text[start:end].lower()))
+        score = len(terms & tokens)
+        if score:
+            scored.append((score, index, start, end))
+    if not scored:
+        return []
+    scored.sort(key=lambda item: (-item[0], item[1]))
+    chosen = scored[: _EVIDENCE_MAX_SPANS]
+    spans: list[tuple[int, int]] = []
+    for _score, _index, start, end in sorted(chosen, key=lambda item: item[1]):
+        if spans and start <= spans[-1][1]:
+            merged = spans[-1][0], end
+            if len(text[merged[0] : merged[1]].encode("utf-8")) <= _EVIDENCE_MAX_SPAN_BYTES:
+                spans[-1] = merged
+                continue
+        spans.append((start, end))
+    return spans
+
+
+def _evidence_segments(text: str) -> list[tuple[int, int]]:
+    """Split one text into sentence-like spans with their character offsets."""
+
+    spans: list[tuple[int, int]] = []
+    start = 0
+    for match in _EVIDENCE_SENTENCE_END.finditer(text):
+        end = match.end()
+        if text[start:end].strip():
+            spans.append((start, end))
+        start = end
+    if start < len(text) and text[start:].strip():
+        spans.append((start, len(text)))
+    return spans
+
+
 def _render_entry(entry: _PreparedContextEntry) -> dict[str, object]:
     rendered: dict[str, object] = {
         "citation": entry.citation,
         "content": entry.content,
         "truncated": entry.truncated,
     }
+    if entry.fragment is not None:
+        rendered["start"] = entry.fragment.start
+        rendered["end"] = entry.fragment.end
     if entry.kind != "memory":
         rendered["kind"] = entry.kind
     return rendered
