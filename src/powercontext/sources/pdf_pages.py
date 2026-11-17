@@ -18,7 +18,9 @@ from __future__ import annotations
 
 import hashlib
 import io
+import math
 import re
+from collections import Counter
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -39,17 +41,122 @@ PDF_PAGE_SOURCE_VERSION = "1"
 _PDF_IDENTITY_PREFIX = "pdf:"
 _PDF_MAGIC = b"%PDF-"
 _QUERY_TOKEN = re.compile(r"[a-z]+|\d+")
-_QUERY_STOPWORDS = frozenset(
+_CANDIDATES_PER_QUERY = 60
+# The evidence pages of a financial question are rarely written in the wording
+# of the question: a question about "revenue" is answered by a page that says
+# "net sales", and a question about "days payable outstanding" is answered by a
+# balance sheet. The bridge below maps the wording of a question onto the
+# vocabulary a financial statement actually uses, so that the lexical search
+# reaches the pages that carry the answer.
+_FINANCE_ALIASES: dict[str, tuple[str, ...]] = {
+    "revenue": ("net sales", "net product sales", "total revenues", "net revenue"),
+    "revenues": ("net sales", "net product sales", "total revenues", "net revenue"),
+    "sales": ("net sales", "net product sales", "revenues"),
+    "margin": ("gross profit", "operating income", "cost of sales"),
+    "gross": ("gross profit", "cost of sales"),
+    "operating": ("operating income", "income from operations"),
+    "profit": ("gross profit", "net income"),
+    "income": ("net income", "operating income"),
+    "earnings": ("net earnings", "net income"),
+    "payable": ("accounts payable", "trade payables"),
+    "payables": ("accounts payable",),
+    "receivable": ("accounts receivable",),
+    "capital": ("capital expenditures", "property plant and equipment", "net sales"),
+    "capex": ("capital expenditures", "purchases of property"),
+    "expenditure": ("capital expenditures", "purchases of property"),
+    "expenditures": ("capital expenditures", "purchases of property"),
+    "asset": ("total assets", "current assets"),
+    "assets": ("total assets", "current assets"),
+    "liabilities": ("total liabilities", "current liabilities"),
+    "equity": ("stockholders equity", "shareholders equity"),
+    "cash": ("cash and cash equivalents", "cash flows"),
+    "tax": ("income taxes", "effective tax rate"),
+    "taxes": ("income taxes", "effective tax rate"),
+    "debt": ("long term debt", "short term debt"),
+    "depreciation": ("depreciation and amortization",),
+    "amortization": ("depreciation and amortization",),
+    "ebitda": ("operating income", "depreciation and amortization"),
+    "customer": ("customer concentration", "significant portion", "substantial portion", "revenues"),
+    "customers": ("customer concentration", "significant portion", "substantial portion", "revenues"),
+    "concentration": ("customer concentration", "accounted for", "of our revenue"),
+    "segment": ("business segment", "reportable segment"),
+    "segments": ("business segment", "reportable segment"),
+    "geographic": ("north america", "latin america", "europe", "asia pacific", "middle east"),
+    "geographies": ("north america", "latin america", "europe", "asia pacific", "middle east"),
+    "geography": ("north america", "latin america", "europe", "asia pacific", "middle east"),
+    "product": ("products", "product categories"),
+    "products": ("products", "product categories"),
+    "category": ("categories", "disaggregation"),
+    "categories": ("category", "disaggregation"),
+    "disaggregation": ("disaggregated",),
+    "legal": ("legal proceedings", "litigation", "contingencies"),
+    "litigation": ("legal proceedings", "contingencies"),
+    "lawsuit": ("legal proceedings",),
+    "lawsuits": ("legal proceedings",),
+    "battle": ("legal proceedings",),
+    "battles": ("legal proceeding",),
+    "proceeding": ("legal proceedings",),
+    "restructuring": ("restructuring", "restructuring charges"),
+    "cyclical": ("cyclicality", "seasonality", "cyclical"),
+    "cyclicality": ("cyclical", "seasonality"),
+    "production": ("production rate",),
+    "rate": ("production rate", "tax rate"),
+    "cost": ("cost of sales", "cost of goods sold"),
+    "costs": ("cost of sales", "cost of goods sold"),
+    "dpo": ("accounts payable", "days payable"),
+    "quick": ("cash and cash equivalents", "marketable securities"),
+    "liquidity": ("current assets", "current liabilities"),
+    "working": ("working capital",),
+    "growth": ("increase", "net sales"),
+    "increase": ("increase",),
+    "decrease": ("decrease",),
+    "acquisition": ("acquisitions", "business combination"),
+    "merger": ("acquisitions", "business combination"),
+    "share": ("per share", "shares"),
+    "dividend": ("dividends",),
+    "interest": ("interest expense",),
+    "risk": ("risk factors",),
+    "volume": ("unit sales", "sales volume"),
+    "price": ("pricing", "average selling price"),
+    "supply": ("supplier", "suppliers"),
+    "supplier": ("suppliers",),
+    "suppliers": ("supplier",),
+}
+# Words that carry no evidence of their own in a financial report.
+_EXPANSION_STOPWORDS = frozenset(
     {
-        "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "can", "did", "do", "does",
-        "for", "from", "has", "have", "how", "into", "its", "not", "our", "should", "than", "that", "the",
-        "their", "then", "there", "these", "they", "this", "was", "were", "what", "when", "where", "which",
-        "who", "why", "will", "with", "would", "you", "your",
+        "a", "an", "the", "is", "are", "was", "were", "be", "been", "being", "do", "does", "did", "what",
+        "which", "who", "whom", "whose", "how", "why", "when", "where", "of", "in", "on", "at", "to", "for",
+        "from", "by", "with", "without", "and", "or", "if", "then", "than", "that", "this", "these", "those",
+        "there", "here", "it", "its", "as", "not", "no", "nor", "but", "so", "such", "can", "could", "should",
+        "would", "may", "might", "will", "shall", "have", "has", "had", "having", "about", "into", "over",
+        "under", "again", "further", "once", "more", "most", "other", "some", "any", "each", "few", "own",
+        "same", "too", "very", "just", "don", "now", "please", "based", "state", "explain", "define",
+        "calculation", "calculate", "according", "information", "company", "companies", "business", "fy",
+        "year", "years", "quarter", "annual", "metric", "useful",
     }
 )
-_RECIPROCAL_RANK_CONSTANT = 60
-_CANDIDATES_PER_QUERY = 60
-_QUERY_VARIANT_LIMIT = 12
+# A question that asks for a figure is answered by a statement page, which
+# carries the numbers; a question that asks for a narrative is answered by the
+# discussion pages, which do not.
+_METRIC_QUESTION_CUES = (
+    "what is",
+    "calculate",
+    "how much",
+    "defined as",
+    "compute",
+    "ratio",
+    "outstanding",
+    "percent",
+    "margin",
+    "in units of",
+)
+_SEARCH_PLAN_LIMIT = 20
+_RERANK_POOL_LIMIT = 400
+_BM25_K1 = 2.2
+_BM25_B = 0.75
+_COVERAGE_WEIGHT = 20.0
+_NUMERIC_WEIGHT = 40.0
 
 __all__ = [
     "PDF_PAGE_SOURCE_DEFINITION",
@@ -188,62 +295,198 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
     """Return the exact Memory citations of the pages that answer one question.
 
-    The search runs through the public Memory API. The question is expanded into
-    its distinctive terms and the per-query rankings are fused offline, so a page
-    that matches one term of the question can still reach the delivered set.
-    Every returned citation points at one distinct physical page.
+    The question is first expanded into short lexical queries, because one long
+    query would demand that a page carries a quarter of its words and would
+    therefore drop the statement pages that carry the answer. The pages the
+    queries return are then reranked offline over the question, its financial
+    wording and the shape of each page, and the best distinct pages are
+    returned. Every returned citation points at one distinct physical page.
     """
 
     from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
 
     if limit < 1:
         raise ValueError("page search limit must be positive")  # noqa: TRY003
-    scores: dict[tuple[str, str], float] = {}
-    hits: dict[tuple[str, str], object] = {}
-    first_seen: dict[tuple[str, str], int] = {}
-    for query in _query_variants(question):
-        page = await memory.search(
-            SearchMemoryRequest(query=query, mode="auto", limit=_CANDIDATES_PER_QUERY)
-        )
+    pool: dict[tuple[str, str], object] = {}
+    best_rank: dict[tuple[str, str], int] = {}
+    for query in _search_plan(question):
+        page = await memory.search(SearchMemoryRequest(query=query, mode="fts", limit=_CANDIDATES_PER_QUERY))
         for rank, hit in enumerate(page.hits, start=1):
             key = (hit.entry_id, hit.entry_version_id)
-            scores[key] = scores.get(key, 0.0) + 1.0 / (_RECIPROCAL_RANK_CONSTANT + rank)
-            hits.setdefault(key, hit)
-            first_seen.setdefault(key, len(first_seen))
-    ordered = sorted(scores, key=lambda key: (-scores[key], first_seen[key]))
-    citations: list[MemoryCitation] = []
-    seen_sources: set[str] = set()
-    for key in ordered:
-        if len(citations) >= limit:
-            break
-        hit = hits[key]
+            pool.setdefault(key, hit)
+            best_rank[key] = min(best_rank.get(key, rank), rank)
+    if not pool:
+        return ()
+    entries: dict[tuple[str, str], object] = {}
+    ranked_keys = sorted(pool, key=lambda key: (best_rank[key], key))
+    for key in ranked_keys[:_RERANK_POOL_LIMIT]:
+        hit = pool[key]
         citation = MemoryCitation(
             memory_ref=hit.memory_ref,
             entry_id=hit.entry_id,
             entry_version_id=hit.entry_version_id,
         )
-        entry = await memory.get(GetMemoryEntryRequest(citation=citation))
+        entries[key] = await memory.get(GetMemoryEntryRequest(citation=citation))
+    scores = _score_pages(question, {key: entry.entry.text for key, entry in entries.items()})
+    ordered = sorted(entries, key=lambda key: (-scores.get(key, 0.0), key))
+    citations: list[MemoryCitation] = []
+    seen_sources: set[str] = set()
+    for key in ordered:
+        if len(citations) >= limit:
+            break
+        entry = entries[key]
         source_ids = {reference.source_id for reference in entry.entry.sources}
         if not source_ids or source_ids & seen_sources:
             continue
         seen_sources |= source_ids
-        citations.append(citation)
+        hit = pool[key]
+        citations.append(
+            MemoryCitation(
+                memory_ref=hit.memory_ref,
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
+            )
+        )
     return tuple(citations)
 
 
-def _query_variants(question: str) -> tuple[str, ...]:
-    """Return the question and the distinctive terms it is built from."""
+def _search_plan(question: str) -> tuple[str, ...]:
+    """Return the short queries that collect the candidate pages of one question.
 
-    variants = [question]
-    seen = {question}
-    for term in _QUERY_TOKEN.findall(question.lower()):
-        if len(term) < 3 or term in _QUERY_STOPWORDS or term in seen:
+    Every query is one or two words, so a page only has to carry one of them to
+    enter the candidate set instead of a quarter of the whole question.
+    """
+
+    queries: list[str] = []
+    for term in _question_terms(question):
+        if term not in queries:
+            queries.append(term)
+        for alias in _finance_aliases(term):
+            for word in alias.split():
+                if word not in queries:
+                    queries.append(word)
+    for term in _question_terms(question):
+        for alias in _finance_aliases(term):
+            if len(alias.split()) > 1 and alias not in queries:
+                queries.append(alias)
+    return tuple(queries[:_SEARCH_PLAN_LIMIT])
+
+
+def _question_terms(question: str) -> tuple[str, ...]:
+    """Return the content words of one question."""
+
+    seen: set[str] = set()
+    terms: list[str] = []
+    for token in _QUERY_TOKEN.findall(question.lower()):
+        if len(token) < 3 or token in _EXPANSION_STOPWORDS or token in seen:
             continue
-        seen.add(term)
-        variants.append(term)
-        if len(variants) > _QUERY_VARIANT_LIMIT:
-            break
-    return tuple(variants)
+        seen.add(token)
+        terms.append(token)
+    return tuple(terms)
+
+
+def _finance_aliases(term: str) -> tuple[str, ...]:
+    """Return the statement vocabulary a question word stands for."""
+
+    return _FINANCE_ALIASES.get(term, _FINANCE_ALIASES.get(_stem(term), ()))
+
+
+def _stem(word: str) -> str:
+    """Reduce a word to the form a financial statement uses for it."""
+
+    if len(word) > 4 and word.endswith("ies"):
+        return word[:-3] + "y"
+    if len(word) > 4 and word.endswith("sses"):
+        return word[:-2]
+    if len(word) > 3 and word.endswith("s") and not word.endswith("ss"):
+        word = word[:-1]
+    for suffix in ("ically", "ility", "ation", "ment", "ally", "ance", "ence", "ings"):
+        if len(word) > len(suffix) + 3 and word.endswith(suffix):
+            return word[: -len(suffix)]
+    return word
+
+
+def _expanded_terms(question: str) -> tuple[str, ...]:
+    """Return the stemmed terms that the page text is matched against."""
+
+    seen: set[str] = set()
+    terms: list[str] = []
+    for term in _question_terms(question):
+        for value in (term, *_finance_aliases(term)):
+            for word in value.split():
+                key = _stem(word)
+                if key and key not in seen:
+                    seen.add(key)
+                    terms.append(key)
+    return tuple(terms)
+
+
+def _is_metric_question(question: str) -> bool:
+    """Report whether the question asks for a computed figure."""
+
+    lowered = question.lower()
+    return any(cue in lowered for cue in _METRIC_QUESTION_CUES)
+
+
+def _numeric_ratio(text: str) -> float:
+    """Return the share of the page that is written as figures."""
+
+    tokens = _QUERY_TOKEN.findall(text.lower())
+    if not tokens:
+        return 0.0
+    figures = sum(1 for token in tokens if token.isdigit())
+    return figures / len(tokens)
+
+
+def _score_pages(question: str, texts: dict[tuple[str, str], str]) -> dict[tuple[str, str], float]:
+    """Rank the candidate pages of one question.
+
+    The score combines the lexical relevance of the page for the question and
+    its financial wording, the share of the question the page covers, and the
+    share of the page that is written as figures.
+    """
+
+    terms = _expanded_terms(question)
+    if not terms:
+        return dict.fromkeys(texts, 0.0)
+    counters = {key: Counter(_stem_tokens(text)) for key, text in texts.items()}
+    lengths = {key: max(1, sum(counter.values())) for key, counter in counters.items()}
+    average = sum(lengths.values()) / max(1, len(lengths))
+    document_frequency: Counter[str] = Counter()
+    for counter in counters.values():
+        document_frequency.update(counter.keys())
+    total = len(counters)
+    unique = tuple(dict.fromkeys(terms))
+    weights = {
+        term: math.log(1 + (total - document_frequency.get(term, 0) + 0.5) / (document_frequency.get(term, 0) + 0.5))
+        for term in unique
+    }
+    quantitative = _is_metric_question(question)
+    scores: dict[tuple[str, str], float] = {}
+    for key, counter in counters.items():
+        length = lengths[key]
+        relevance = 0.0
+        for term in unique:
+            frequency = counter.get(term, 0)
+            if not frequency:
+                continue
+            relevance += (
+                weights[term]
+                * (frequency * _BM25_K1)
+                / (frequency + _BM25_K1 * (1 - _BM25_B + _BM25_B * length / average))
+            )
+        covered = sum(1 for term in unique if counter.get(term))
+        score = relevance + _COVERAGE_WEIGHT * (covered / len(unique))
+        if quantitative:
+            score += _NUMERIC_WEIGHT * _numeric_ratio(texts[key])
+        scores[key] = score
+    return scores
+
+
+def _stem_tokens(text: str) -> list[str]:
+    """Return the stemmed word and number tokens of one text."""
+
+    return [_stem(token) for token in _QUERY_TOKEN.findall(text.lower())]
 
 
 def _read_pages(content: bytes) -> list[tuple[int, str]]:
