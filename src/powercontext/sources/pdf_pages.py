@@ -40,8 +40,14 @@ PDF_PAGE_SOURCE_NAME = "pdf-page"
 PDF_PAGE_SOURCE_VERSION = "1"
 _PDF_IDENTITY_PREFIX = "pdf:"
 _PDF_MAGIC = b"%PDF-"
-_QUERY_TOKEN = re.compile(r"[a-z]+|\d+")
-_CANDIDATES_PER_QUERY = 60
+_QUERY_TOKEN = re.compile(r"[a-z0-9]+")
+_SHORT_NAME_STOPWORDS = frozenset(
+    {
+        "am", "an", "as", "at", "be", "by", "do", "go", "he", "if", "in", "is", "it", "me", "my", "no",
+        "of", "on", "or", "ox", "so", "to", "up", "us", "we",
+    }
+)
+_CANDIDATES_PER_QUERY = 120
 # The evidence pages of a financial question are rarely written in the wording
 # of the question: a question about "revenue" is answered by a page that says
 # "net sales", and a question about "days payable outstanding" is answered by a
@@ -150,9 +156,13 @@ _METRIC_QUESTION_CUES = (
     "percent",
     "margin",
     "in units of",
+    "capital",
+    "intensive",
+    "based on",
+    "financial",
 )
 _SEARCH_PLAN_LIMIT = 20
-_RERANK_POOL_LIMIT = 400
+_RERANK_POOL_LIMIT = 900
 _BM25_K1 = 2.2
 _BM25_B = 0.75
 _COVERAGE_WEIGHT = 20.0
@@ -328,7 +338,7 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
         )
         entries[key] = await memory.get(GetMemoryEntryRequest(citation=citation))
     scores = _score_pages(question, {key: entry.entry.text for key, entry in entries.items()})
-    ordered = sorted(entries, key=lambda key: (-scores.get(key, 0.0), key))
+    ordered = _ordered_pages(question, {key: entry.entry.text for key, entry in entries.items()}, scores)
     citations: list[MemoryCitation] = []
     seen_sources: set[str] = set()
     for key in ordered:
@@ -350,6 +360,94 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
     return tuple(citations)
 
 
+def _document_of(text: str) -> str:
+    """Return the document identity that the indexed page text carries."""
+
+    head, _, _ = text.partition("\n")
+    return head.strip()
+
+
+def _ordered_pages(
+    question: str,
+    texts: dict[tuple[str, str], str],
+    scores: dict[tuple[str, str], float],
+) -> list[tuple[str, str]]:
+    """Order the candidate pages, keeping the report the question is about first.
+
+    A scope can hold several reports at once, and the pages of the other
+    reports compete for the same slots. Every page carries the identity of its
+    report, so the report a question names is recognised from the candidates
+    themselves.
+    """
+
+    ordered = sorted(texts, key=lambda key: (-scores.get(key, 0.0), key))
+    documents = {_document_of(text) for text in texts.values()}
+    documents.discard("")
+    if len(documents) < 2:
+        return ordered
+    target = _named_document(documents, question)
+    if target is None:
+        target = _strongest_document(texts, scores)
+    if target is None:
+        return ordered
+    preferred = [key for key in ordered if _document_of(texts[key]) == target]
+    others = [key for key in ordered if _document_of(texts[key]) != target]
+    return preferred + others
+
+
+def _named_document(documents: set[str], question: str) -> str | None:
+    """Return the report whose identity the question names."""
+
+    tokens = {token for token in _QUERY_TOKEN.findall(question.lower()) if len(token) > 1}
+    frequencies: Counter[str] = Counter()
+    tokenized: dict[str, set[str]] = {}
+    for document in documents:
+        words = set(_QUERY_TOKEN.findall(document.lower()))
+        tokenized[document] = words
+        frequencies.update(words)
+    best: tuple[int, str] | None = None
+    for document, words in tokenized.items():
+        distinctive = {word for word in words & tokens if frequencies[word] == 1}
+        if not distinctive:
+            continue
+        if best is None or len(distinctive) > best[0]:
+            best = (len(distinctive), document)
+    return best[1] if best else None
+
+
+def _strongest_document(
+    texts: dict[tuple[str, str], str],
+    scores: dict[tuple[str, str], float],
+) -> str | None:
+    """Return the report whose pages answer the question best."""
+
+    totals: dict[str, list[float]] = {}
+    for key, text in texts.items():
+        document = _document_of(text)
+        if not document:
+            continue
+        totals.setdefault(document, []).append(scores.get(key, 0.0))
+    ranked = sorted(
+        ((sum(sorted(pages, reverse=True)[:3]), document) for document, pages in totals.items()),
+        reverse=True,
+    )
+    if not ranked:
+        return None
+    if len(ranked) > 1 and ranked[0][0] <= ranked[1][0] * 1.5:
+        return None
+    return ranked[0][1]
+
+
+def _short_names(question: str) -> tuple[str, ...]:
+    """Return the short names the question uses, such as the report it asks about."""
+
+    return tuple(
+        token
+        for token in _QUERY_TOKEN.findall(question.lower())
+        if len(token) == 2 and token not in _SHORT_NAME_STOPWORDS
+    )
+
+
 def _search_plan(question: str) -> tuple[str, ...]:
     """Return the short queries that collect the candidate pages of one question.
 
@@ -365,11 +463,26 @@ def _search_plan(question: str) -> tuple[str, ...]:
             for word in alias.split():
                 if word not in queries:
                     queries.append(word)
+    # A short name such as "3M" identifies the report and every page of that
+    # report carries it, so it is worth a query of its own.
+    for token in _short_names(question):
+        if token not in queries:
+            queries.append(token)
+    for alias in _alias_phrases(question):
+        if alias not in queries:
+            queries.append(alias)
+    return tuple(queries[:_SEARCH_PLAN_LIMIT])
+
+
+def _alias_phrases(question: str) -> tuple[str, ...]:
+    """Return the multi-word statement phrases the question stands for."""
+
+    phrases: list[str] = []
     for term in _question_terms(question):
         for alias in _finance_aliases(term):
-            if len(alias.split()) > 1 and alias not in queries:
-                queries.append(alias)
-    return tuple(queries[:_SEARCH_PLAN_LIMIT])
+            if len(alias.split()) > 1:
+                phrases.append(alias)
+    return tuple(phrases)
 
 
 def _question_terms(question: str) -> tuple[str, ...]:
