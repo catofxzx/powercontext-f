@@ -287,16 +287,7 @@ def _tool_call_names(chain: list[_SessionRecord]) -> dict[str, str]:
 def _render_event(record: _SessionRecord, tool_names: dict[str, str] | None = None) -> tuple[str, str] | None:
     payload = record.payload
     if record.event_type == "message":
-        message = payload.get("message")
-        if not isinstance(message, dict):
-            return None
-        role = message.get("role")
-        if not isinstance(role, str) or not role:
-            return None
-        body = _message_body(message, tool_names)
-        if not body:
-            return None
-        return role, body
+        return _render_message(payload.get("message"), tool_names)
     if record.event_type in {"compaction", "branch_summary"}:
         summary = payload.get("summary")
         if not isinstance(summary, str) or not summary.strip():
@@ -308,6 +299,28 @@ def _render_event(record: _SessionRecord, tool_names: dict[str, str] | None = No
             return None
         return "custom", body
     return None
+
+
+def _render_message(message: object, tool_names: dict[str, str] | None) -> tuple[str, str] | None:
+    """Return the role and the body of one message of the branch."""
+
+    if not isinstance(message, dict):
+        return None
+    role = message.get("role")
+    if not isinstance(role, str) or not role:
+        return None
+    if role == "system":
+        # The prompt of the session is not evidence of what happened in it.
+        return None
+    if role in {"compactionSummary", "branchSummary"}:
+        summary = message.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            return None
+        return ("compaction" if role == "compactionSummary" else "branch_summary"), summary
+    body = _message_body(message, tool_names)
+    if not body:
+        return None
+    return role, body
 
 
 def _message_body(message: dict[str, Any], tool_names: dict[str, str] | None = None) -> str:
