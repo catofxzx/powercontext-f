@@ -182,7 +182,11 @@ class PiSessionConnector:
 
         records = _read_archive(self._path.read_bytes())
         events = _visible_events(records, self._leaf_id)
+        session_id = records[0].payload["id"]
         imported = _imported_records(session.checkpoint)
+        if _checkpoint_session_id(session.checkpoint) not in (None, session_id):
+            # Another session shares the binding, and its history is not this one.
+            imported = {}
         digests = {record.identifier: _record_digest(record.payload) for record in records}
         for event_id, digest in imported.items():
             current = digests.get(event_id)
@@ -198,7 +202,7 @@ class PiSessionConnector:
             merged[event.event_id] = digests[event.event_id]
         return ConnectorRunCompletion(
             status=ConnectorRunStatus.COMPLETE,
-            checkpoint={"session_id": records[0].payload.get("id"), "imported": merged},
+            checkpoint={"session_id": session_id, "imported": merged},
         )
 
 
@@ -396,3 +400,12 @@ def _imported_records(checkpoint: object) -> dict[str, str]:
     if not isinstance(imported, dict):
         return {}
     return {key: value for key, value in imported.items() if isinstance(key, str) and isinstance(value, str)}
+
+
+def _checkpoint_session_id(checkpoint: object) -> str | None:
+    """Return the session the checkpoint belongs to, when it names one."""
+
+    if not isinstance(checkpoint, dict):
+        return None
+    session_id = checkpoint.get("session_id")
+    return session_id if isinstance(session_id, str) and session_id else None
