@@ -309,8 +309,9 @@ def _render_message(message: object, tool_names: dict[str, str] | None) -> tuple
     role = message.get("role")
     if not isinstance(role, str) or not role:
         return None
-    if role == "system":
-        # The prompt of the session is not evidence of what happened in it.
+    if role in {"system", "thinking"}:
+        # The prompt of the session and the reasoning of a model are not
+        # evidence of what happened in it.
         return None
     if role in {"compactionSummary", "branchSummary"}:
         summary = message.get("summary")
