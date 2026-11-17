@@ -62,11 +62,12 @@ _EVIDENCE_STOPWORDS = frozenset(
         "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "very",
         "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with",
         "would", "you", "your",
+        # Words that frame a question instead of naming the evidence it asks for.
+        "according", "annual", "based", "business", "calculate", "calculation", "companies", "company",
+        "define", "don", "explain", "fy", "information", "metric", "please", "quarter", "state", "useful",
+        "year", "years",
     }
 )
-_EVIDENCE_WINDOW_BYTES = 320
-_EVIDENCE_WINDOW_PADDING = 60
-_EVIDENCE_MAX_SPANS = 4
 _Item = TypeVar("_Item")
 
 
@@ -370,6 +371,7 @@ class PreparedContextBuilder:
                         candidates.hits,
                         scope_id=scope_id,
                         query=request.query,
+                        max_bytes=request.max_bytes,
                     )
                     for candidates in memory_candidates
                 )
@@ -564,6 +566,7 @@ class PreparedContextBuilder:
         *,
         scope_id: str,
         query: str,
+        max_bytes: int,
     ) -> tuple[_PreparedContextEntry, ...]:
         """Select the exact text slices of the Memory entries that answer one query."""
 
@@ -576,6 +579,7 @@ class PreparedContextBuilder:
         texts: list[str] = []
         spans_per_hit: list[list[tuple[int, int]]] = []
         seen: set[tuple[str, str]] = set()
+        used = 0
         for hit in hits:
             if hit.memory_ref != memory_ref:
                 raise PreparedContextInvariantError("memory-ref-mismatch")
@@ -585,43 +589,27 @@ class PreparedContextBuilder:
             seen.add(citation_key)
             if not hit.entry_id.strip() or not hit.entry_version_id.strip() or not hit.text.strip():
                 continue
-            addresses.append(
-                MemoryEntryAddress(
-                    memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
-                    entry_id=hit.entry_id,
-                    entry_version_id=hit.entry_version_id,
-                )
+            address = MemoryEntryAddress(
+                memory=ArtifactAddress(scope_id=scope_id, artifact=hit.memory_ref),
+                entry_id=hit.entry_id,
+                entry_version_id=hit.entry_version_id,
             )
+            citation = {
+                "scope_id": scope_id,
+                "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                "entry_id": address.entry_id,
+                "entry_version_id": address.entry_version_id,
+            }
+            # The budget is spent in the order the candidates are delivered, so
+            # every candidate only receives the room the earlier ones left.
+            planned = _evidence_plan(address, citation, hit.text, terms, max_bytes - used)
+            if planned is None:
+                continue
+            used += planned[0]
+            addresses.append(address)
             texts.append(hit.text)
-            spans_per_hit.append(_evidence_spans(hit.text, terms))
-        entries: list[_PreparedContextEntry] = []
-        for round_index in range(max((len(spans) for spans in spans_per_hit), default=0)):
-            for address, text, spans in zip(addresses, texts, spans_per_hit, strict=True):
-                if round_index >= len(spans):
-                    continue
-                start, end = spans[round_index]
-                fragment = PreparedFragment(
-                    address=address,
-                    start=start,
-                    end=end,
-                    text=text[start:end],
-                )
-                entries.append(
-                    _PreparedContextEntry(
-                        origin=address,
-                        kind="memory",
-                        citation={
-                            "scope_id": scope_id,
-                            "memory_ref": address.memory.artifact.model_dump(mode="json"),
-                            "entry_id": address.entry_id,
-                            "entry_version_id": address.entry_version_id,
-                        },
-                        content=fragment.text,
-                        truncated=False,
-                        fragment=fragment,
-                    )
-                )
-        return tuple(entries)
+            spans_per_hit.append([(planned[1], planned[2])])
+        return _evidence_entries_from(addresses, texts, spans_per_hit, scope_id)
 
     def _topic_memory_entries(
         self,
@@ -858,54 +846,165 @@ def _query_terms(query: str) -> frozenset[str]:
     )
 
 
-def _evidence_spans(text: str, terms: frozenset[str], /) -> list[tuple[int, int]]:
-    """Return the character spans of the text that carry the query terms.
+def _evidence_plan(
+    address: MemoryEntryAddress,
+    citation: dict[str, object],
+    text: str,
+    terms: frozenset[str],
+    remaining: int,
+) -> tuple[int, int, int] | None:
+    """Plan the fragment of one candidate and report the bytes it spends."""
 
-    The spans are whole sentences, extended with the neighbouring sentence when
-    the evidence is not confined to one of them, so a labelled evidence passage
-    stays inside one span even when it does not start or end on a sentence edge.
+    overhead = _evidence_item_overhead(address, citation)
+    capacity = remaining - _rendered_bytes(()) - overhead
+    if capacity <= 0:
+        return None
+    span = _evidence_span(text, terms, capacity)
+    if span is None:
+        return None
+    start, end = span
+    end = _evidence_fit(address, citation, text, start, end, remaining)
+    if end is None:
+        return None
+    content = text[start:end]
+    return overhead + len(content.encode("utf-8")), start, end
+
+
+def _evidence_fit(
+    address: MemoryEntryAddress,
+    citation: dict[str, object],
+    text: str,
+    start: int,
+    end: int,
+    remaining: int,
+) -> int | None:
+    """Return the largest end of the passage that still fits the budget."""
+
+    low = start + 1
+    high = end
+    best: int | None = None
+    while low <= high:
+        middle = (low + high) // 2
+        probe = _evidence_entry(address, citation, text, start, middle)
+        if _rendered_bytes((probe,)) <= remaining:
+            best = middle
+            low = middle + 1
+        else:
+            high = middle - 1
+    return best
+
+
+def _evidence_entry(
+    address: MemoryEntryAddress,
+    citation: dict[str, object],
+    text: str,
+    start: int,
+    end: int,
+) -> _PreparedContextEntry:
+    """Return the entry that delivers one passage of one candidate."""
+
+    fragment = PreparedFragment(address=address, start=start, end=end, text=text[start:end])
+    return _PreparedContextEntry(
+        origin=address,
+        kind="memory",
+        citation=citation,
+        content=fragment.text,
+        truncated=False,
+        fragment=fragment,
+    )
+
+
+def _evidence_entries_from(
+    addresses: Sequence[MemoryEntryAddress],
+    texts: Sequence[str],
+    spans_per_hit: Sequence[Sequence[tuple[int, int]]],
+    scope_id: str,
+) -> tuple[_PreparedContextEntry, ...]:
+    """Turn the planned spans into the entries the context delivers."""
+
+    entries: list[_PreparedContextEntry] = []
+    for round_index in range(max((len(spans) for spans in spans_per_hit), default=0)):
+        for address, text, spans in zip(addresses, texts, spans_per_hit, strict=True):
+            if round_index >= len(spans):
+                continue
+            start, end = spans[round_index]
+            fragment = PreparedFragment(
+                address=address,
+                start=start,
+                end=end,
+                text=text[start:end],
+            )
+            entries.append(
+                _PreparedContextEntry(
+                    origin=address,
+                    kind="memory",
+                    citation={
+                        "scope_id": scope_id,
+                        "memory_ref": address.memory.artifact.model_dump(mode="json"),
+                        "entry_id": address.entry_id,
+                        "entry_version_id": address.entry_version_id,
+                    },
+                    content=fragment.text,
+                    truncated=False,
+                    fragment=fragment,
+                )
+            )
+    return tuple(entries)
+
+
+def _evidence_item_overhead(address: MemoryEntryAddress, citation: dict[str, object]) -> int:
+    """Return the bytes one delivered fragment spends outside its own text."""
+
+    probe = _evidence_entry(address, citation, "", 0, 0)
+    return _rendered_bytes((probe,)) - _rendered_bytes(())
+
+
+def _evidence_span(text: str, terms: frozenset[str], capacity: int) -> tuple[int, int] | None:
+    """Return the character span of the passage that carries the evidence.
+
+    The passage is the sentence that covers the most of the question, grown to
+    the room the byte budget leaves and centred on that sentence, so one
+    passage holds as much of the evidence as the budget allows.
     """
 
-    if not terms:
-        return []
+    if not terms or capacity <= 0:
+        return None
     lowered = text.lower()
-    sentences = _evidence_sentences(text)
+    sentence_spans = _evidence_sentences(text)
     frequencies: Counter[str] = Counter()
-    for start, end in sentences:
+    for start, end in sentence_spans:
         frequencies.update(set(_EVIDENCE_TOKEN.findall(lowered[start:end])))
-    total = len(sentences) or 1
+    total = len(sentence_spans) or 1
     weights = {term: math.log(1 + total / (1 + frequencies.get(term, 0))) for term in terms}
-    positions: list[tuple[int, int, str]] = []
-    for term in terms:
-        for match in re.finditer(re.escape(term), lowered):
-            positions.append((match.start(), match.end(), term))
-    if not positions:
-        return []
-    positions.sort()
-    # Keep the window that carries the rarest query terms together: a labelled
-    # evidence passage holds the distinctive terms of the claim, while the topic
-    # words of a claim repeat in every section of the document.
-    spans: list[tuple[float, int, int]] = []
-    for index, (start, _end, term) in enumerate(positions):
-        window_start = max(0, start - _EVIDENCE_WINDOW_PADDING)
-        window_end = min(len(text), start + _EVIDENCE_WINDOW_BYTES)
-        covered = {item[2] for item in positions if window_start <= item[0] < window_end}
-        score = sum(weights.get(item, 0.0) for item in covered)
-        spans.append((score, window_start, window_end))
-    if not spans:
-        return []
-    spans.sort(key=lambda item: (-item[0], item[1]))
-    best_score, best_start, best_end = spans[0]
-    selected: list[tuple[int, int]] = [(best_start, best_end)]
-    # Continue the winning window with the text that follows it, so the selected
-    # intervals stay adjacent and merge into one continuous passage.
-    cursor = best_end
-    while len(selected) < _EVIDENCE_MAX_SPANS and cursor < len(text):
-        end = min(len(text), cursor + _EVIDENCE_WINDOW_BYTES)
-        selected.append((cursor, end))
-        cursor = end
-    del best_score
-    return selected
+    anchor: tuple[int, int] | None = None
+    best_score = 0.0
+    for start, end in sentence_spans:
+        present = {term for term in terms if term in lowered[start:end]}
+        if not present:
+            continue
+        # The distinctive terms of the question identify the passage, while the
+        # topic words repeat in every part of the document.
+        score = sum(weights.get(term, 0.0) for term in present) + 0.25 * len(present)
+        if score > best_score:
+            best_score = score
+            anchor = (start, end)
+    if anchor is None:
+        return None
+    anchor_end = len(text[: anchor[1]].encode("utf-8"))
+    total_bytes = len(text.encode("utf-8"))
+    end_bytes = min(total_bytes, anchor_end + capacity // 2)
+    start_bytes = max(0, end_bytes - capacity)
+    start = _character_index(text, start_bytes)
+    end = _character_index(text, end_bytes)
+    if end <= start:
+        return None
+    return start, end
+
+
+def _character_index(text: str, byte_offset: int) -> int:
+    """Return the character index at the given UTF-8 byte offset."""
+
+    return len(text.encode("utf-8")[:byte_offset].decode("utf-8", errors="ignore"))
 
 
 def _evidence_sentences(text: str) -> list[tuple[int, int]]:
