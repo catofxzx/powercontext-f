@@ -48,9 +48,9 @@ _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _EVIDENCE_TOKEN = re.compile(r"[a-z]+|\d+")
-_EVIDENCE_SENTENCE_END = re.compile(r"[.!?](?=\s|$)")
+_EVIDENCE_WINDOW_BYTES = 240
+_EVIDENCE_WINDOW_PADDING = 60
 _EVIDENCE_MAX_SPANS = 4
-_EVIDENCE_MAX_SPAN_BYTES = 512
 _Item = TypeVar("_Item")
 
 
@@ -839,43 +839,44 @@ def _query_terms(query: str) -> frozenset[str]:
 
 
 def _evidence_spans(text: str, terms: frozenset[str], /) -> list[tuple[int, int]]:
-    """Return the character spans of the text that carry the query terms."""
+    """Return the character windows of the text that carry the query terms.
+
+    The windows are cut around the matched terms rather than around sentence
+    boundaries, so a labelled evidence passage stays inside one window even when
+    it does not start or end on a sentence edge.
+    """
 
     if not terms:
         return []
-    scored: list[tuple[int, int, int, int]] = []
-    for index, (start, end) in enumerate(_evidence_segments(text)):
-        tokens = set(_EVIDENCE_TOKEN.findall(text[start:end].lower()))
-        score = len(terms & tokens)
-        if score:
-            scored.append((score, index, start, end))
-    if not scored:
+    lowered = text.lower()
+    positions: list[int] = []
+    for term in terms:
+        positions.extend(match.start() for match in re.finditer(re.escape(term), lowered))
+    if not positions:
         return []
-    scored.sort(key=lambda item: (-item[0], item[1]))
-    chosen = scored[: _EVIDENCE_MAX_SPANS]
+    positions.sort()
+    clusters: list[list[int]] = []
+    for position in positions:
+        if clusters and position - clusters[-1][-1] <= _EVIDENCE_WINDOW_BYTES:
+            clusters[-1].append(position)
+        else:
+            clusters.append([position])
+    windows: list[tuple[int, int, int]] = []
+    for cluster in clusters:
+        start = max(0, cluster[0] - _EVIDENCE_WINDOW_PADDING)
+        end = min(len(text), start + _EVIDENCE_WINDOW_BYTES)
+        start = max(0, end - _EVIDENCE_WINDOW_BYTES)
+        covered = len({term for term in terms if term in lowered[start:end]})
+        windows.append((covered, start, end))
+    windows.sort(key=lambda item: (-item[0], item[1]))
     spans: list[tuple[int, int]] = []
-    for _score, _index, start, end in sorted(chosen, key=lambda item: item[1]):
-        if spans and start <= spans[-1][1]:
-            merged = spans[-1][0], end
-            if len(text[merged[0] : merged[1]].encode("utf-8")) <= _EVIDENCE_MAX_SPAN_BYTES:
-                spans[-1] = merged
-                continue
+    for _covered, start, end in windows:
+        if len(spans) >= _EVIDENCE_MAX_SPANS:
+            break
+        if any(not (end <= other_start or start >= other_end) for other_start, other_end in spans):
+            continue
         spans.append((start, end))
-    return spans
-
-
-def _evidence_segments(text: str) -> list[tuple[int, int]]:
-    """Split one text into sentence-like spans with their character offsets."""
-
-    spans: list[tuple[int, int]] = []
-    start = 0
-    for match in _EVIDENCE_SENTENCE_END.finditer(text):
-        end = match.end()
-        if text[start:end].strip():
-            spans.append((start, end))
-        start = end
-    if start < len(text) and text[start:].strip():
-        spans.append((start, len(text)))
+    spans.sort()
     return spans
 
 
