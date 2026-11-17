@@ -238,9 +238,10 @@ def _visible_events(records: tuple[_SessionRecord, ...], leaf_id: str | None) ->
         current = None if current.parent_id is None else by_id.get(current.parent_id)
     chain.reverse()
     session_id = records[0].payload["id"]
+    tool_names = _tool_call_names(chain)
     events: list[PiEventInput] = []
     for record in chain:
-        rendered = _render_event(record)
+        rendered = _render_event(record, tool_names)
         if rendered is None:
             continue
         role, content = rendered
@@ -258,7 +259,32 @@ def _visible_events(records: tuple[_SessionRecord, ...], leaf_id: str | None) ->
     return tuple(events)
 
 
-def _render_event(record: _SessionRecord) -> tuple[str, str] | None:
+def _tool_call_names(chain: list[_SessionRecord]) -> dict[str, str]:
+    """Return the name of every tool call of the branch, keyed by its call id.
+
+    A tool result names the call it answers but not the tool, so the name is
+    taken from the call the result belongs to.
+    """
+
+    names: dict[str, str] = {}
+    for record in chain:
+        message = record.payload.get("message")
+        if not isinstance(message, dict):
+            continue
+        content = message.get("content")
+        if not isinstance(content, list):
+            continue
+        for block in content:
+            if not isinstance(block, dict) or block.get("type") != "toolCall":
+                continue
+            call_id = block.get("id")
+            name = block.get("name")
+            if isinstance(call_id, str) and isinstance(name, str) and name:
+                names.setdefault(call_id, name)
+    return names
+
+
+def _render_event(record: _SessionRecord, tool_names: dict[str, str] | None = None) -> tuple[str, str] | None:
     payload = record.payload
     if record.event_type == "message":
         message = payload.get("message")
@@ -267,7 +293,7 @@ def _render_event(record: _SessionRecord) -> tuple[str, str] | None:
         role = message.get("role")
         if not isinstance(role, str) or not role:
             return None
-        body = _message_body(message)
+        body = _message_body(message, tool_names)
         if not body:
             return None
         return role, body
@@ -284,7 +310,7 @@ def _render_event(record: _SessionRecord) -> tuple[str, str] | None:
     return None
 
 
-def _message_body(message: dict[str, Any]) -> str:
+def _message_body(message: dict[str, Any], tool_names: dict[str, str] | None = None) -> str:
     role = message.get("role")
     if role == "bashExecution":
         command = message.get("command")
@@ -295,6 +321,9 @@ def _message_body(message: dict[str, Any]) -> str:
     if role == "toolResult":
         tool_name = message.get("toolName")
         tool_call_id = message.get("toolCallId")
+        if not isinstance(tool_name, str) or not tool_name:
+            # The result names the call it answers, so the tool is named by it.
+            tool_name = (tool_names or {}).get(tool_call_id if isinstance(tool_call_id, str) else "")
         text = _blocks_text(message.get("content"))
         if not text:
             return ""
@@ -339,19 +368,11 @@ def _read_archive(content: bytes) -> tuple[_SessionRecord, ...]:
     try:
         text = content.decode("utf-8-sig")
     except UnicodeDecodeError as error:
-        raise ValueError("Pi session archive must be valid UTF-8") from error
+        raise ValueError("Pi session archive must be valid UTF-8") from error  # noqa: TRY003
     lines = [line for line in text.splitlines() if line.strip()]
     if not lines:
         raise ValueError("Pi session archive must contain records")  # noqa: TRY003
-    payloads: list[dict[str, Any]] = []
-    for line in lines:
-        try:
-            payload = json.loads(line)
-        except ValueError as error:
-            raise ValueError("Pi session archive must contain valid JSON records") from error
-        if not isinstance(payload, dict):
-            raise ValueError("Pi session archive records must be JSON objects")  # noqa: TRY003
-        payloads.append(payload)
+    payloads = [_archive_payload(line) for line in lines]
     header = payloads[0]
     if header.get("type") != "session" or header.get("version") != PI_SESSION_FORMAT_VERSION:
         raise ValueError("Pi session archive must start with a version 3 session record")  # noqa: TRY003
@@ -361,31 +382,50 @@ def _read_archive(content: bytes) -> tuple[_SessionRecord, ...]:
     records: list[_SessionRecord] = []
     seen: set[str] = set()
     for payload in payloads[1:]:
-        identifier = payload.get("id")
-        if not isinstance(identifier, str) or not identifier:
-            raise ValueError("Pi session records must declare an id")  # noqa: TRY003
-        if identifier in seen:
-            raise ValueError(f"Pi session record {identifier!r} appears more than once")  # noqa: TRY003
-        parent = payload.get("parentId")
-        if parent is not None and not isinstance(parent, str):
-            raise ValueError("Pi session parent id must be a string")  # noqa: TRY003
-        if isinstance(parent, str) and not parent:
-            parent = None
-        if parent is not None and parent not in seen:
-            raise ValueError(f"Pi session record {identifier!r} references an unknown parent")  # noqa: TRY003
-        event_type = payload.get("type")
-        if not isinstance(event_type, str) or not event_type:
-            raise ValueError("Pi session records must declare a type")  # noqa: TRY003
-        seen.add(identifier)
-        records.append(
-            _SessionRecord(
-                identifier=identifier,
-                parent_id=parent,
-                event_type=event_type,
-                payload=payload,
-            )
-        )
+        record = _session_record(payload, seen)
+        seen.add(record.identifier)
+        records.append(record)
     return tuple(records)
+
+
+def _archive_payload(line: str) -> dict[str, Any]:
+    """Return one archive record, rejecting a line that is not a JSON object."""
+
+    try:
+        payload = json.loads(line)
+    except ValueError as error:
+        raise ValueError("Pi session archive must contain valid JSON records") from error  # noqa: TRY003
+    if not isinstance(payload, dict):
+        raise ValueError("Pi session archive records must be JSON objects")  # noqa: TRY003, TRY004
+    return payload
+
+
+def _session_record(payload: dict[str, Any], seen: set[str]) -> _SessionRecord:
+    """Return one archive record, rejecting a broken link in the branch graph."""
+
+    identifier = payload.get("id")
+    if not isinstance(identifier, str) or not identifier:
+        raise ValueError("Pi session records must declare an id")  # noqa: TRY003
+    if identifier in seen:
+        raise ValueError(f"Pi session record {identifier!r} appears more than once")  # noqa: TRY003
+    if "parentId" not in payload:
+        raise ValueError(f"Pi session record {identifier!r} does not declare a parent")  # noqa: TRY003
+    parent = payload.get("parentId")
+    if parent is not None and not isinstance(parent, str):
+        raise ValueError("Pi session parent id must be a string")  # noqa: TRY003
+    if isinstance(parent, str) and not parent:
+        parent = None
+    if parent is not None and parent not in seen:
+        raise ValueError(f"Pi session record {identifier!r} references an unknown parent")  # noqa: TRY003
+    event_type = payload.get("type")
+    if not isinstance(event_type, str) or not event_type:
+        raise ValueError("Pi session records must declare a type")  # noqa: TRY003
+    return _SessionRecord(
+        identifier=identifier,
+        parent_id=parent,
+        event_type=event_type,
+        payload=payload,
+    )
 
 
 def _record_digest(payload: dict[str, Any]) -> str:

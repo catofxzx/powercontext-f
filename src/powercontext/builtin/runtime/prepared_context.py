@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -861,11 +863,11 @@ def _evidence_plan(
     if span is None:
         return None
     start, end = span
-    end = _evidence_fit(address, citation, text, start, end, remaining)
-    if end is None:
+    fitted = _evidence_fit(address, citation, text, start, end, remaining)
+    if fitted is None:
         return None
-    content = text[start:end]
-    return overhead + len(content.encode("utf-8")), start, end
+    content = text[fitted:end]
+    return overhead + len(content.encode("utf-8")), fitted, end
 
 
 def _evidence_fit(
@@ -876,19 +878,24 @@ def _evidence_fit(
     end: int,
     remaining: int,
 ) -> int | None:
-    """Return the largest end of the passage that still fits the budget."""
+    """Return the start of the longest passage that still fits the budget.
 
-    low = start + 1
-    high = end
+    The passage keeps its end, because the evidence a claim is answered with
+    sits at the back of the text.
+    """
+
+    low = start
+    high = end - 1
     best: int | None = None
     while low <= high:
         middle = (low + high) // 2
-        probe = _evidence_entry(address, citation, text, start, middle)
+        probe = _evidence_entry(address, citation, text, middle, end)
         if _rendered_bytes((probe,)) <= remaining:
+            # A passage that starts earlier holds more text, so keep looking.
             best = middle
-            low = middle + 1
-        else:
             high = middle - 1
+        else:
+            low = middle + 1
     return best
 
 
@@ -960,19 +967,41 @@ def _evidence_item_overhead(address: MemoryEntryAddress, citation: dict[str, obj
 def _evidence_span(text: str, terms: frozenset[str], capacity: int) -> tuple[int, int] | None:
     """Return the character span of the passage that carries the evidence.
 
-    The passage is the closing part of the text: a claim is answered by the
-    finding a document states after its background, and the byte budget is
-    spent on the part that answers the question rather than on its setup. A
-    text that fits the budget is delivered whole.
+    The passage is centred on the latest sentence that answers the question
+    nearly as well as the best one: a claim is answered by the finding a
+    document states after its background, so the passage belongs to the back
+    of the text, while the question still decides where it sits.
     """
 
     if not terms or capacity <= 0:
         return None
-    total = len(text.encode("utf-8"))
-    if total <= capacity:
-        return (0, len(text))
-    start = _character_index(text, total - capacity)
-    end = len(text)
+    lowered = text.lower()
+    sentence_spans = _evidence_sentences(text)
+    frequencies: Counter[str] = Counter()
+    for start, end in sentence_spans:
+        frequencies.update(set(_EVIDENCE_TOKEN.findall(lowered[start:end])))
+    total = len(sentence_spans) or 1
+    weights = {term: math.log(1 + total / (1 + frequencies.get(term, 0))) for term in terms}
+    ranked: list[tuple[float, int, int]] = []
+    for start, end in sentence_spans:
+        present = {term for term in terms if term in lowered[start:end]}
+        if not present:
+            continue
+        # The distinctive terms of the question identify the passage, while the
+        # topic words repeat in every part of the document.
+        score = sum(weights.get(term, 0.0) for term in present) + 0.25 * len(present)
+        ranked.append((score, start, end))
+    if not ranked:
+        return None
+    ranked.sort(key=lambda item: (-item[0], item[1]))
+    best = ranked[0][0]
+    anchor = max((item for item in ranked if item[0] >= best * 0.5), key=lambda item: item[1])
+    anchor_end = len(text[: anchor[2]].encode("utf-8"))
+    total_bytes = len(text.encode("utf-8"))
+    end_bytes = min(total_bytes, anchor_end + capacity // 2)
+    start_bytes = max(0, end_bytes - capacity)
+    start = _character_index(text, start_bytes)
+    end = _character_index(text, end_bytes)
     if end <= start:
         return None
     return start, end
