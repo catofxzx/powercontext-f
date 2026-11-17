@@ -224,6 +224,9 @@ def parse_pi_session(value: PiSessionInput) -> tuple[PiEventInput, ...]:
 
 def _visible_events(records: tuple[_SessionRecord, ...], leaf_id: str | None) -> tuple[PiEventInput, ...]:
     by_id = {record.identifier: record for record in records}
+    if not records:
+        # A session without an event has no branch to capture.
+        raise ValueError("Pi session archive holds no event to capture")  # noqa: TRY003
     leaf = records[-1].identifier if leaf_id is None else leaf_id
     if leaf not in by_id:
         raise ValueError(f"Pi session leaf {leaf!r} is not part of the archive")  # noqa: TRY003
@@ -336,8 +339,9 @@ def _message_body(message: dict[str, Any], tool_names: dict[str, str] | None = N
         tool_name = message.get("toolName")
         tool_call_id = message.get("toolCallId")
         if not isinstance(tool_name, str) or not tool_name:
-            # The result names the call it answers, so the tool is named by it.
-            tool_name = (tool_names or {}).get(tool_call_id if isinstance(tool_call_id, str) else "")
+            # The result names the call it answers, so the tool is named by it;
+            # a result that names no tool at all is named unknown.
+            tool_name = (tool_names or {}).get(tool_call_id if isinstance(tool_call_id, str) else "") or "unknown"
         text = _blocks_text(message.get("content"))
         if not text:
             return ""
