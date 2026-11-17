@@ -102,6 +102,14 @@ class _SessionRecord:
     payload: dict[str, Any]
 
 
+@dataclass(frozen=True, slots=True)
+class _Archive:
+    """One parsed archive: the session it belongs to and its event records."""
+
+    session_id: str
+    records: tuple[_SessionRecord, ...]
+
+
 class PiEventSourceAdapter:
     """Resolve and read one captured Pi event."""
 
@@ -180,14 +188,12 @@ class PiSessionConnector:
     async def run(self, session: ConnectorRunSession, /) -> ConnectorRunCompletion:
         """Import the events that the selected branch gained since the last run."""
 
-        records = _read_archive(self._path.read_bytes())
-        events = _visible_events(records, self._leaf_id)
-        session_id = records[0].payload["id"]
-        imported = _imported_records(session.checkpoint)
-        if _checkpoint_session_id(session.checkpoint) not in (None, session_id):
-            # Another session shares the binding, and its history is not this one.
-            imported = {}
-        digests = {record.identifier: _record_digest(record.payload) for record in records}
+        archive = _read_archive(self._path.read_bytes())
+        events = _visible_events(archive.records, self._leaf_id, archive.session_id)
+        session_id = archive.session_id
+        sessions = _checkpoint_sessions(session.checkpoint)
+        imported = dict(sessions.get(session_id, {}))
+        digests = {record.identifier: _record_digest(record.payload) for record in archive.records}
         for event_id, digest in imported.items():
             current = digests.get(event_id)
             if current is not None and current != digest:
@@ -200,9 +206,10 @@ class PiSessionConnector:
             if outcome.status is not ConnectorSubmissionStatus.ACCEPTED:
                 raise ValueError(f"Pi event {event.event_id!r} was not accepted by the runtime")  # noqa: TRY003
             merged[event.event_id] = digests[event.event_id]
+        sessions[session_id] = merged
         return ConnectorRunCompletion(
             status=ConnectorRunStatus.COMPLETE,
-            checkpoint={"session_id": session_id, "imported": merged},
+            checkpoint={"sessions": sessions},
         )
 
 
@@ -218,11 +225,15 @@ def pi_event_source_id(session_id: str, event_id: str) -> str:
 def parse_pi_session(value: PiSessionInput) -> tuple[PiEventInput, ...]:
     """Return the visible events of the selected branch, from the root to the leaf."""
 
-    records = _read_archive(value.content)
-    return _visible_events(records, value.leaf_id)
+    archive = _read_archive(value.content)
+    return _visible_events(archive.records, value.leaf_id, archive.session_id)
 
 
-def _visible_events(records: tuple[_SessionRecord, ...], leaf_id: str | None) -> tuple[PiEventInput, ...]:
+def _visible_events(
+    records: tuple[_SessionRecord, ...],
+    leaf_id: str | None,
+    session_id: str,
+) -> tuple[PiEventInput, ...]:
     by_id = {record.identifier: record for record in records}
     if not records:
         # A session without an event has no branch to capture.
@@ -240,7 +251,6 @@ def _visible_events(records: tuple[_SessionRecord, ...], leaf_id: str | None) ->
         chain.append(current)
         current = None if current.parent_id is None else by_id.get(current.parent_id)
     chain.reverse()
-    session_id = records[0].payload["id"]
     tool_names = _tool_call_names(chain)
     events: list[PiEventInput] = []
     for record in chain:
@@ -380,7 +390,7 @@ def _blocks_text(content: object) -> str:
     return "\n".join(parts)
 
 
-def _read_archive(content: bytes) -> tuple[_SessionRecord, ...]:
+def _read_archive(content: bytes) -> _Archive:
     if not content:
         raise ValueError("Pi session archive must not be empty")  # noqa: TRY003
     try:
@@ -403,7 +413,7 @@ def _read_archive(content: bytes) -> tuple[_SessionRecord, ...]:
         record = _session_record(payload, seen)
         seen.add(record.identifier)
         records.append(record)
-    return tuple(records)
+    return _Archive(session_id=session_id, records=tuple(records))
 
 
 def _archive_payload(line: str) -> dict[str, Any]:
@@ -451,10 +461,29 @@ def _record_digest(payload: dict[str, Any]) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _imported_records(checkpoint: object) -> dict[str, str]:
+def _checkpoint_sessions(checkpoint: object) -> dict[str, dict[str, str]]:
+    """Return the imported events of every session the checkpoint remembers.
+
+    The progress of one session never replaces the progress of another: a
+    binding that is pointed at a second archive keeps the history of the first
+    one, so switching back imports nothing twice.
+    """
+
+    sessions: dict[str, dict[str, str]] = {}
     if not isinstance(checkpoint, dict):
-        return {}
-    imported = checkpoint.get("imported")
+        return sessions
+    remembered = checkpoint.get("sessions")
+    if isinstance(remembered, dict):
+        for session_id, imported in remembered.items():
+            if isinstance(session_id, str) and isinstance(imported, dict):
+                sessions[session_id] = _imported_records(imported)
+    legacy_session = _checkpoint_session_id(checkpoint)
+    if legacy_session is not None and legacy_session not in sessions:
+        sessions[legacy_session] = _imported_records(checkpoint.get("imported"))
+    return sessions
+
+
+def _imported_records(imported: object) -> dict[str, str]:
     if not isinstance(imported, dict):
         return {}
     return {key: value for key, value in imported.items() if isinstance(key, str) and isinstance(value, str)}
