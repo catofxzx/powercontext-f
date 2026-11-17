@@ -365,6 +365,8 @@ def _read_archive(content: bytes) -> tuple[_SessionRecord, ...]:
         parent = payload.get("parentId")
         if parent is not None and not isinstance(parent, str):
             raise ValueError("Pi session parent id must be a string")  # noqa: TRY003
+        if isinstance(parent, str) and not parent:
+            parent = None
         if parent is not None and parent not in seen:
             raise ValueError(f"Pi session record {identifier!r} references an unknown parent")  # noqa: TRY003
         event_type = payload.get("type")

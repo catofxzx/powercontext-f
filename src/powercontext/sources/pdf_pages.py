@@ -18,6 +18,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import re
 from typing import TYPE_CHECKING
 from urllib.parse import quote
 
@@ -37,6 +38,18 @@ PDF_PAGE_SOURCE_NAME = "pdf-page"
 PDF_PAGE_SOURCE_VERSION = "1"
 _PDF_IDENTITY_PREFIX = "pdf:"
 _PDF_MAGIC = b"%PDF-"
+_QUERY_TOKEN = re.compile(r"[a-z]+|\d+")
+_QUERY_STOPWORDS = frozenset(
+    {
+        "a", "an", "and", "any", "are", "as", "at", "be", "been", "but", "by", "can", "did", "do", "does",
+        "for", "from", "has", "have", "how", "into", "its", "not", "our", "should", "than", "that", "the",
+        "their", "then", "there", "these", "they", "this", "was", "were", "what", "when", "where", "which",
+        "who", "why", "will", "with", "would", "you", "your",
+    }
+)
+_RECIPROCAL_RANK_CONSTANT = 60
+_CANDIDATES_PER_QUERY = 60
+_QUERY_VARIANT_LIMIT = 12
 
 __all__ = [
     "PDF_PAGE_SOURCE_DEFINITION",
@@ -175,18 +188,35 @@ def parse_pdf_document(value: PDFDocumentInput) -> tuple[PDFPageInput, ...]:
 async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[MemoryCitation, ...]:
     """Return the exact Memory citations of the pages that answer one question.
 
-    The search runs through the public Memory API, and every returned citation
-    points at one distinct physical page of the captured documents.
+    The search runs through the public Memory API. The question is expanded into
+    its distinctive terms and the per-query rankings are fused offline, so a page
+    that matches one term of the question can still reach the delivered set.
+    Every returned citation points at one distinct physical page.
     """
 
     from powercontext.builtin.runtime.models import GetMemoryEntryRequest, SearchMemoryRequest
 
     if limit < 1:
         raise ValueError("page search limit must be positive")  # noqa: TRY003
-    page = await memory.search(SearchMemoryRequest(query=question, mode="auto", limit=max(limit * 4, limit)))
+    scores: dict[tuple[str, str], float] = {}
+    hits: dict[tuple[str, str], object] = {}
+    first_seen: dict[tuple[str, str], int] = {}
+    for query in _query_variants(question):
+        page = await memory.search(
+            SearchMemoryRequest(query=query, mode="auto", limit=_CANDIDATES_PER_QUERY)
+        )
+        for rank, hit in enumerate(page.hits, start=1):
+            key = (hit.entry_id, hit.entry_version_id)
+            scores[key] = scores.get(key, 0.0) + 1.0 / (_RECIPROCAL_RANK_CONSTANT + rank)
+            hits.setdefault(key, hit)
+            first_seen.setdefault(key, len(first_seen))
+    ordered = sorted(scores, key=lambda key: (-scores[key], first_seen[key]))
     citations: list[MemoryCitation] = []
     seen_sources: set[str] = set()
-    for hit in page.hits:
+    for key in ordered:
+        if len(citations) >= limit:
+            break
+        hit = hits[key]
         citation = MemoryCitation(
             memory_ref=hit.memory_ref,
             entry_id=hit.entry_id,
@@ -198,9 +228,22 @@ async def search_pdf_pages(memory, question: str, limit: int = 10) -> tuple[Memo
             continue
         seen_sources |= source_ids
         citations.append(citation)
-        if len(citations) >= limit:
-            break
     return tuple(citations)
+
+
+def _query_variants(question: str) -> tuple[str, ...]:
+    """Return the question and the distinctive terms it is built from."""
+
+    variants = [question]
+    seen = {question}
+    for term in _QUERY_TOKEN.findall(question.lower()):
+        if len(term) < 3 or term in _QUERY_STOPWORDS or term in seen:
+            continue
+        seen.add(term)
+        variants.append(term)
+        if len(variants) > _QUERY_VARIANT_LIMIT:
+            break
+    return tuple(variants)
 
 
 def _read_pages(content: bytes) -> list[tuple[int, str]]:
