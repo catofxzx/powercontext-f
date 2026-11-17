@@ -18,7 +18,7 @@ from __future__ import annotations
 
 import asyncio
 from collections import OrderedDict
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import TYPE_CHECKING
 
 from powercontext.builtin.inference.models import EmbeddingResult, InferenceUsage
@@ -35,16 +35,20 @@ class _PendingRequest:
     """One caller waiting for the vectors of its own ordered text batch."""
 
     texts: tuple[str, ...]
-    future: asyncio.Future[EmbeddingResult]
+    cached: dict[str, tuple[float, ...]] = field(default_factory=dict)
+    waiters: list[tuple[str, asyncio.Future[tuple[float, ...]]]] = field(default_factory=list)
+    future: asyncio.Future[EmbeddingResult] | None = None
 
 
 class CoalescingEmbeddingModel:
     """Coalesce concurrent Embedding batches and cache successful vectors.
 
-    Callers that need the same text inside one coalescing window share a single
-    provider request. Successful vectors are kept in a bounded LRU cache so later
-    calls reuse them without issuing another provider request. Cancelling one
-    caller never cancels the shared provider work other callers wait for.
+    Callers that need the same text share one provider request: a text that is
+    already running is never sent to the provider twice, so a late caller joins
+    the work that is already in flight. Successful vectors are kept in a bounded
+    LRU cache so later calls reuse them without issuing another provider
+    request. Cancelling one caller never cancels the shared provider work other
+    callers wait for.
     """
 
     def __init__(
@@ -67,6 +71,11 @@ class CoalescingEmbeddingModel:
         self._coalesce_seconds = float(coalesce_ms) / 1000
         self._cache_size = cache_size
         self._cache: OrderedDict[str, tuple[float, ...]] = OrderedDict()
+        self._inflight: dict[str, asyncio.Future[tuple[float, ...]]] = {}
+        self._unassigned: list[str] = []
+        self._batch_of_text: dict[str, int] = {}
+        self._batch_usage: dict[int, InferenceUsage] = {}
+        self._batch_counter = 0
         self._pending: list[_PendingRequest] = []
         self._flush_task: asyncio.Task[None] | None = None
 
@@ -76,26 +85,38 @@ class CoalescingEmbeddingModel:
         ordered = tuple(texts)
         if not ordered:
             return EmbeddingResult(vectors=(), usage=InferenceUsage(requests=0))
-        request = _PendingRequest(texts=ordered, future=asyncio.get_running_loop().create_future())
+        loop = asyncio.get_running_loop()
+        request = _PendingRequest(texts=ordered, future=loop.create_future())
+        for text in dict.fromkeys(ordered):
+            if text in self._cache:
+                request.cached[text] = self._cache[text]
+                self._touch(text)
+                continue
+            future = self._inflight.get(text)
+            if future is None:
+                future = loop.create_future()
+                self._inflight[text] = future
+                self._unassigned.append(text)
+            request.waiters.append((text, future))
         self._pending.append(request)
-        if self._flush_task is None:
+        if self._flush_task is None or self._flush_task.done():
             self._flush_task = asyncio.create_task(self._flush())
         return await request.future
 
     async def _flush(self) -> None:
-        """Collect concurrent callers and resolve every request that waits on them."""
+        """Compute the texts that still need a vector and resolve their callers."""
 
         try:
             while True:
                 await self._wait_window()
-                requests = [request for request in self._pending if not request.future.done()]
-                self._pending.clear()
-                if not requests:
+                if not self._unassigned and not self._pending:
                     break
-                await self._process(requests)
+                await self._process()
+                if not self._unassigned and not self._pending:
+                    break
         finally:
             self._flush_task = None
-            if self._pending:
+            if self._pending or self._unassigned:
                 self._flush_task = asyncio.create_task(self._flush())
 
     async def _wait_window(self) -> None:
@@ -104,82 +125,97 @@ class CoalescingEmbeddingModel:
         else:
             await asyncio.sleep(0)
 
-    async def _process(self, requests: list[_PendingRequest]) -> None:
-        cached = dict(self._cache)
-        needed: list[str] = []
-        seen: set[str] = set()
-        for request in requests:
-            for text in request.texts:
-                if text in seen or text in cached:
-                    continue
-                seen.add(text)
-                needed.append(text)
+    async def _process(self) -> None:
+        texts = list(self._unassigned)
+        self._unassigned.clear()
         batches = [
-            tuple(needed[index : index + self._max_batch_size])
-            for index in range(0, len(needed), self._max_batch_size)
+            tuple(texts[index : index + self._max_batch_size])
+            for index in range(0, len(texts), self._max_batch_size)
         ]
-        outcomes: list[tuple[EmbeddingResult | None, Exception | None]] = []
-        vectors: dict[str, tuple[float, ...]] = {}
+        computed: dict[str, tuple[float, ...]] = {}
+        failures: dict[str, Exception] = {}
         for batch in batches:
+            self._batch_counter += 1
+            batch_id = self._batch_counter
             try:
                 result = await self._model.embed(batch)
             except Exception as error:  # noqa: BLE001 - the provider error belongs to this batch only
-                outcomes.append((None, error))
+                self._fail(batch, error, failures)
                 continue
             if len(result.vectors) != len(batch):
-                outcomes.append(
-                    (
-                        None,
-                        ValueError(
-                            f"embedding provider returned {len(result.vectors)} vectors for {len(batch)} texts"  # noqa: TRY003
-                        ),
-                    )
+                self._fail(
+                    batch,
+                    ValueError(f"embedding provider returned {len(result.vectors)} vectors for {len(batch)} texts"),  # noqa: TRY003
+                    failures,
                 )
                 continue
-            outcomes.append((result, None))
+            self._batch_usage[batch_id] = result.usage
             for text, vector in zip(batch, result.vectors, strict=True):
-                vectors[text] = vector
+                computed[text] = vector
+                self._batch_of_text[text] = batch_id
                 self._store(text, vector)
-        batch_index: dict[str, int] = {}
-        for index, batch in enumerate(batches):
-            for text in batch:
-                batch_index[text] = index
+                self._release(text, vector)
+        requests = list(self._pending)
+        self._pending.clear()
         for request in requests:
-            self._deliver(request, cached, vectors, batch_index, outcomes)
+            if any(not future.done() for _text, future in request.waiters):
+                self._pending.append(request)
+                continue
+            self._resolve(request, computed, failures)
 
-    def _deliver(
+    def _fail(self, batch: tuple[str, ...], error: Exception, failures: dict[str, Exception]) -> None:
+        for text in batch:
+            failures[text] = error
+            self._release(text, error)
+
+    def _release(self, text: str, result: tuple[float, ...] | Exception) -> None:
+        future = self._inflight.pop(text, None)
+        if future is None or future.done():
+            return
+        if isinstance(result, Exception):
+            future.set_exception(result)
+        else:
+            future.set_result(result)
+
+    def _resolve(
         self,
         request: _PendingRequest,
-        cached: dict[str, tuple[float, ...]],
-        vectors: dict[str, tuple[float, ...]],
-        batch_index: dict[str, int],
-        outcomes: list[tuple[EmbeddingResult | None, Exception | None]],
+        computed: dict[str, tuple[float, ...]],
+        failures: dict[str, Exception],
     ) -> None:
-        if request.future.done():
+        if request.future is None or request.future.done():
             return
-        indexes = {batch_index[text] for text in request.texts if text in batch_index}
-        for index in sorted(indexes):
-            result, error = outcomes[index]
-            if error is not None:
-                request.future.set_exception(error)
-                return
-            if result is None:
-                request.future.set_exception(ValueError("embedding provider returned no result"))  # noqa: TRY003
-                return
-        resolved: list[tuple[float, ...]] = []
+        vectors: list[tuple[float, ...]] = []
         for text in request.texts:
-            if text in vectors:
-                resolved.append(vectors[text])
+            cached = request.cached.get(text)
+            if cached is not None:
+                vectors.append(cached)
                 continue
-            vector = cached.get(text)
+            vector = computed.get(text)
             if vector is None:
-                request.future.set_exception(ValueError("embedding vector missing for one input text"))  # noqa: TRY003
-                return
-            self._touch(text)
-            resolved.append(vector)
-        usages = [outcomes[index][0].usage for index in sorted(indexes) if outcomes[index][0] is not None]
+                error = failures.get(text)
+                if error is None:
+                    for waited, future in request.waiters:
+                        if waited != text:
+                            continue
+                        if future.done() and future.exception() is not None:
+                            error = future.exception()
+                            break
+                        if future.done():
+                            vector = future.result()
+                            break
+                if vector is None:
+                    request.future.set_exception(
+                        error if error is not None else ValueError("embedding vector missing for one input text")  # noqa: TRY003
+                    )
+                    return
+            vectors.append(vector)
+        batch_ids = sorted({self._batch_of_text[text] for text, _ in request.waiters if text in self._batch_of_text})
         request.future.set_result(
-            EmbeddingResult(vectors=tuple(resolved), usage=_merge_usage(usages))
+            EmbeddingResult(
+                vectors=tuple(vectors),
+                usage=_merge_usage([self._batch_usage[batch_id] for batch_id in batch_ids]),
+            )
         )
 
     def _store(self, text: str, vector: tuple[float, ...]) -> None:
@@ -188,7 +224,8 @@ class CoalescingEmbeddingModel:
         self._cache[text] = vector
         self._cache.move_to_end(text)
         while len(self._cache) > self._cache_size:
-            self._cache.popitem(last=False)
+            evicted, _ = self._cache.popitem(last=False)
+            self._batch_of_text.pop(evicted, None)
 
     def _touch(self, text: str) -> None:
         if text in self._cache:
