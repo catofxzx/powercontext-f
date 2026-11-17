@@ -17,7 +17,9 @@
 from __future__ import annotations
 
 import json
+import math
 import re
+from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -48,7 +50,21 @@ _ELLIPSIS = "…"
 _BEGIN_MARKER = "BEGIN_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _END_MARKER = "END_POWERCONTEXT_PREPARED_CONTEXT_V1"
 _EVIDENCE_TOKEN = re.compile(r"[a-z]+|\d+")
-_EVIDENCE_WINDOW_BYTES = 240
+_EVIDENCE_STOPWORDS = frozenset(
+    {
+        "a", "about", "above", "after", "again", "against", "all", "also", "am", "an", "and", "any", "are", "as",
+        "at", "be", "because", "been", "before", "being", "below", "between", "both", "but", "by", "can", "could",
+        "did", "do", "does", "doing", "down", "during", "each", "few", "for", "from", "further", "had", "has",
+        "have", "having", "he", "her", "here", "hers", "him", "his", "how", "however", "i", "if", "in", "into",
+        "is", "it", "its", "itself", "just", "may", "me", "might", "more", "most", "much", "must", "my", "no",
+        "nor", "not", "now", "of", "off", "on", "once", "only", "or", "other", "our", "ours", "out", "over",
+        "own", "same", "she", "should", "so", "some", "such", "than", "that", "the", "their", "theirs", "them",
+        "then", "there", "these", "they", "this", "those", "through", "to", "too", "under", "until", "up", "very",
+        "was", "we", "were", "what", "when", "where", "which", "while", "who", "whom", "why", "will", "with",
+        "would", "you", "your",
+    }
+)
+_EVIDENCE_WINDOW_BYTES = 320
 _EVIDENCE_WINDOW_PADDING = 60
 _EVIDENCE_MAX_SPANS = 4
 _Item = TypeVar("_Item")
@@ -833,50 +849,77 @@ def _text_item(entry: _PreparedContextEntry) -> ContextTextItem:
 
 
 def _query_terms(query: str) -> frozenset[str]:
-    """Return the lowercase word and number terms of one query."""
+    """Return the distinctive lowercase word and number terms of one query."""
 
-    return frozenset(_EVIDENCE_TOKEN.findall(query.lower()))
+    return frozenset(
+        term
+        for term in _EVIDENCE_TOKEN.findall(query.lower())
+        if term not in _EVIDENCE_STOPWORDS and len(term) > 1
+    )
 
 
 def _evidence_spans(text: str, terms: frozenset[str], /) -> list[tuple[int, int]]:
-    """Return the character windows of the text that carry the query terms.
+    """Return the character spans of the text that carry the query terms.
 
-    The windows are cut around the matched terms rather than around sentence
-    boundaries, so a labelled evidence passage stays inside one window even when
-    it does not start or end on a sentence edge.
+    The spans are whole sentences, extended with the neighbouring sentence when
+    the evidence is not confined to one of them, so a labelled evidence passage
+    stays inside one span even when it does not start or end on a sentence edge.
     """
 
     if not terms:
         return []
     lowered = text.lower()
-    positions: list[int] = []
+    sentences = _evidence_sentences(text)
+    frequencies: Counter[str] = Counter()
+    for start, end in sentences:
+        frequencies.update(set(_EVIDENCE_TOKEN.findall(lowered[start:end])))
+    total = len(sentences) or 1
+    weights = {term: math.log(1 + total / (1 + frequencies.get(term, 0))) for term in terms}
+    positions: list[tuple[int, int, str]] = []
     for term in terms:
-        positions.extend(match.start() for match in re.finditer(re.escape(term), lowered))
+        for match in re.finditer(re.escape(term), lowered):
+            positions.append((match.start(), match.end(), term))
     if not positions:
         return []
     positions.sort()
-    clusters: list[list[int]] = []
-    for position in positions:
-        if clusters and position - clusters[-1][-1] <= _EVIDENCE_WINDOW_BYTES:
-            clusters[-1].append(position)
-        else:
-            clusters.append([position])
-    windows: list[tuple[int, int, int]] = []
-    for cluster in clusters:
-        start = max(0, cluster[0] - _EVIDENCE_WINDOW_PADDING)
-        end = min(len(text), start + _EVIDENCE_WINDOW_BYTES)
-        start = max(0, end - _EVIDENCE_WINDOW_BYTES)
-        covered = len({term for term in terms if term in lowered[start:end]})
-        windows.append((covered, start, end))
-    windows.sort(key=lambda item: (-item[0], item[1]))
+    # Keep the window that carries the rarest query terms together: a labelled
+    # evidence passage holds the distinctive terms of the claim, while the topic
+    # words of a claim repeat in every section of the document.
+    spans: list[tuple[float, int, int]] = []
+    for index, (start, _end, term) in enumerate(positions):
+        window_start = max(0, start - _EVIDENCE_WINDOW_PADDING)
+        window_end = min(len(text), start + _EVIDENCE_WINDOW_BYTES)
+        covered = {item[2] for item in positions if window_start <= item[0] < window_end}
+        score = sum(weights.get(item, 0.0) for item in covered)
+        spans.append((score, window_start, window_end))
+    if not spans:
+        return []
+    spans.sort(key=lambda item: (-item[0], item[1]))
+    best_score, best_start, best_end = spans[0]
+    selected: list[tuple[int, int]] = [(best_start, best_end)]
+    # Continue the winning window with the text that follows it, so the selected
+    # intervals stay adjacent and merge into one continuous passage.
+    cursor = best_end
+    while len(selected) < _EVIDENCE_MAX_SPANS and cursor < len(text):
+        end = min(len(text), cursor + _EVIDENCE_WINDOW_BYTES)
+        selected.append((cursor, end))
+        cursor = end
+    del best_score
+    return selected
+
+
+def _evidence_sentences(text: str) -> list[tuple[int, int]]:
+    """Split one text into sentence spans with their character offsets."""
+
     spans: list[tuple[int, int]] = []
-    for _covered, start, end in windows:
-        if len(spans) >= _EVIDENCE_MAX_SPANS:
-            break
-        if any(not (end <= other_start or start >= other_end) for other_start, other_end in spans):
-            continue
-        spans.append((start, end))
-    spans.sort()
+    start = 0
+    for match in re.finditer(r"[.!?](?=\s|$)", text):
+        end = match.end()
+        if text[start:end].strip():
+            spans.append((start, end))
+        start = end
+    if start < len(text) and text[start:].strip():
+        spans.append((start, len(text)))
     return spans
 
 
