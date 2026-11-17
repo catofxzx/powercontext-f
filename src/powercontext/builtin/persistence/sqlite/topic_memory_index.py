@@ -262,6 +262,7 @@ _TOPIC_VECTOR_SEARCH_SQL = text(
     JOIN pc_topic_memory_active_topics AS a
       ON a.scope_id = v.scope_id AND a.artifact_id = v.artifact_id AND a.revision = v.revision
     WHERE v.scope_id = :scope_id
+      AND a.lifecycle_state = 'active'
     ORDER BY nearest.distance, a.artifact_id, a.revision DESC
     LIMIT :candidate_limit
     """
@@ -290,6 +291,7 @@ _CHUNK_VECTOR_SEARCH_SQL = text(
           ON c.scope_id = v.scope_id AND c.artifact_id = v.artifact_id
          AND c.revision = v.revision AND c.chunk_ordinal = v.chunk_ordinal
         WHERE v.scope_id = :scope_id
+          AND a.lifecycle_state = 'active'
     )
     SELECT artifact_id, revision, title, summary,
            chunk_ordinal, start_offset, chunk_text, distance
@@ -328,7 +330,13 @@ class SQLiteTopicMemoryFTSIndex:
         await connection.exec_driver_sql(_CREATE_CHUNK_FTS_SQL)
         await connection.exec_driver_sql("DELETE FROM pc_topic_memory_topic_fts")
         await connection.exec_driver_sql("DELETE FROM pc_topic_memory_chunk_fts")
-        topics = (await connection.execute(select(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE))).mappings()
+        topics = (
+            await connection.execute(
+                select(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE).where(
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
+                )
+            )
+        ).mappings()
         for row in topics:
             await connection.execute(_INSERT_TOPIC_FTS_SQL, _topic_fts_values(row))
         chunks = (
@@ -342,7 +350,7 @@ class SQLiteTopicMemoryFTSIndex:
                     (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id)
                     & (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.artifact_id)
                     & (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.revision == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.revision),
-                )
+                ).where(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active")
             )
         ).mappings()
         for row in chunks:
@@ -383,6 +391,64 @@ class SQLiteTopicMemoryFTSIndex:
                     "searchable_text": analyze_text(chunk.text),
                 },
             )
+
+    async def withdraw(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        identity = {"scope_id": scope_id, "artifact_id": topic_ref.artifact_id}
+        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
+        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
+
+    async def restore(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        identity = {"scope_id": scope_id, "artifact_id": topic_ref.artifact_id}
+        await connection.execute(_DELETE_TOPIC_FTS_SQL, identity)
+        await connection.execute(_DELETE_CHUNK_FTS_SQL, identity)
+        topic = (
+            (
+                await connection.execute(
+                    select(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE).where(
+                        TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                        TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id == topic_ref.artifact_id,
+                        TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
+                    )
+                )
+            )
+            .mappings()
+            .one_or_none()
+        )
+        if topic is None:
+            return
+        await connection.execute(_INSERT_TOPIC_FTS_SQL, _topic_fts_values(topic))
+        chunks = (
+            await connection.execute(
+                select(
+                    TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE,
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.title,
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.summary,
+                ).join(
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE,
+                    (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id)
+                    & (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.artifact_id)
+                    & (TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.revision == TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.revision),
+                ).where(
+                    TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id == scope_id,
+                    TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.artifact_id == topic_ref.artifact_id,
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
+                )
+            )
+        ).mappings()
+        for row in chunks:
+            await connection.execute(_INSERT_CHUNK_FTS_SQL, _chunk_fts_values(row))
 
     async def search(
         self,
@@ -597,6 +663,24 @@ class SQLiteTopicMemoryVectorIndex:
                     ),
                 },
             )
+
+    async def withdraw(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the withdrawn state."""
+
+    async def restore(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the restored state."""
 
     async def search(
         self,

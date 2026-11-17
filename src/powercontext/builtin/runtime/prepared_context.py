@@ -398,7 +398,7 @@ class PreparedContextBuilder:
         experience_candidates: Sequence[PreparedExperienceCandidates],
         profile_candidates: Sequence[PreparedProfileCandidate],
         topic_memory_hits: Sequence[TopicMemorySearchHit],
-    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions]:
+    ) -> tuple[str | None, tuple[PreparedContextOrigin, ...], PreparedContextOmissions, tuple[PreparedFragment, ...]]:
         assembly = request.assembly
         if assembly is None:
             raise PreparedContextInvariantError("text-assembly-missing")
@@ -471,9 +471,9 @@ class PreparedContextBuilder:
             dropped_no_fitting_truncation=dropped_no_fitting_truncation,
         )
         if not included:
-            return None, (), omissions
+            return None, (), omissions, ()
         content = render_context_text(included, assembly)
-        return content, tuple(origins), omissions
+        return content, tuple(origins), omissions, ()
 
     def _profile_entries(self, candidates: Sequence[PreparedProfileCandidate]) -> tuple[_PreparedContextEntry, ...]:
         entries = []

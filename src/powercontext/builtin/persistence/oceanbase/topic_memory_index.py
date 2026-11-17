@@ -100,6 +100,7 @@ SELECT a.artifact_id, a.revision, a.title, a.summary, n.distance
 FROM candidates AS n
 JOIN pc_topic_memory_active_topics AS a
   ON a.scope_id = n.scope_id AND a.artifact_id = n.artifact_id AND a.revision = n.revision
+WHERE a.lifecycle_state = 'active'
 ORDER BY distance, artifact_id, revision DESC
 """
 _CHUNK_VECTOR_SEARCH = """
@@ -124,6 +125,7 @@ WITH neighbors AS (
     JOIN pc_topic_memory_active_chunks AS c
       ON c.scope_id = n.scope_id AND c.artifact_id = n.artifact_id
      AND c.revision = n.revision AND c.chunk_ordinal = n.chunk_ordinal
+    WHERE a.lifecycle_state = 'active'
 )
 SELECT artifact_id, revision, title, summary,
        chunk_ordinal, start_offset, chunk_text, distance
@@ -164,6 +166,24 @@ class OceanBaseTopicMemoryFTSIndex:
     ) -> None:
         pass
 
+    async def withdraw(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the withdrawn state."""
+
+    async def restore(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the restored state."""
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -185,6 +205,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
                 topic_score,
             )
         )
@@ -193,6 +214,7 @@ class OceanBaseTopicMemoryFTSIndex:
             .select_from(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
                 topic_score,
                 topic_coverage,
             )
@@ -207,6 +229,7 @@ class OceanBaseTopicMemoryFTSIndex:
                 )
                 .where(
                     TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                    TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
                     topic_score,
                     topic_coverage,
                 )
@@ -258,6 +281,7 @@ class OceanBaseTopicMemoryFTSIndex:
             )
             .where(
                 TOPIC_MEMORY_ACTIVE_CHUNKS_TABLE.c.scope_id == scope_id,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
                 chunk_score,
             )
             .subquery()
@@ -447,6 +471,24 @@ class OceanBaseTopicMemoryVectorIndex:
                 for chunk, embedding in zip(projection.chunks, projection.chunk_embeddings, strict=True)
             ],
         )
+
+    async def withdraw(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the withdrawn state."""
+
+    async def restore(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """The relational active projection itself carries the restored state."""
 
     async def search(
         self,

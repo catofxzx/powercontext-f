@@ -55,6 +55,24 @@ class TopicMemoryIndex(Protocol):
         /,
     ) -> None: ...
 
+    async def withdraw(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """Remove one Topic from the searchable channels without touching its Revision."""
+
+    async def restore(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        """Return one withdrawn Topic to the searchable channels."""
+
     async def search(
         self,
         connection: AsyncConnection,
@@ -90,6 +108,24 @@ class NoTopicMemoryIndex:
         _scope_id: str,
         _topic_ref: ArtifactRef,
         _projection: TopicMemoryProjection,
+        /,
+    ) -> None:
+        pass
+
+    async def withdraw(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        pass
+
+    async def restore(
+        self,
+        _connection: AsyncConnection,
+        _scope_id: str,
+        _topic_ref: ArtifactRef,
         /,
     ) -> None:
         pass
@@ -149,6 +185,26 @@ class CompositeTopicMemoryIndex:
     ) -> None:
         for index in self.indexes:
             await index.replace(connection, scope_id, topic_ref, projection)
+
+    async def withdraw(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        for index in self.indexes:
+            await index.withdraw(connection, scope_id, topic_ref)
+
+    async def restore(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        topic_ref: ArtifactRef,
+        /,
+    ) -> None:
+        for index in self.indexes:
+            await index.restore(connection, scope_id, topic_ref)
 
     async def search(
         self,

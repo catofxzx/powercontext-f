@@ -16,6 +16,8 @@
 
 from __future__ import annotations
 
+from collections.abc import Sequence
+
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncConnection
 
@@ -74,3 +76,28 @@ class SourceProcessingPendingProvider:
                 if intent is None or intent.dirty_generation == intent.clean_generation:
                     await intents.mark_dirty(connection, scope, self._binding)
         return str(rows[-1][0]) if len(rows) == limit else None
+
+    async def pending_counts(self, connection: AsyncConnection, scope_ids: Sequence[str], /) -> dict[str, int]:
+        """Return each Scope's pending Source count for this Family.
+
+        The count is the persisted journal identity of the Sources written
+        after this Family's last successful cursor. A replayed identity keeps
+        its first journal position, so it never counts twice.
+        """
+
+        if not scope_ids:
+            return {}
+        heads = SOURCE_JOURNAL_HEADS_TABLE
+        rows = (
+            await connection.execute(
+                select(heads.c.scope_id, heads.c.position).where(heads.c.scope_id.in_(tuple(scope_ids)))
+            )
+        ).all()
+        positions = {str(scope_id): int(position) for scope_id, position in rows}
+        cursors = await SourceCursorRepository().load_many(connection, scope_ids, self._binding)
+        counts: dict[str, int] = {}
+        for scope_id in scope_ids:
+            cursor = cursors.get(scope_id)
+            sequence = 0 if cursor is None else cursor.cursor.sequence
+            counts[scope_id] = max(0, positions.get(scope_id, 0) - sequence)
+        return counts

@@ -118,6 +118,28 @@ class MemoryIndex(Protocol):
     ) -> tuple[MemoryProjection, ...]: ...
 
 
+class HybridMemoryIndex(Protocol):
+    """One statement that returns the candidates of both search channels.
+
+    A backend that can read its full-text and vector indexes inside a single
+    statement implements this protocol and joins the composite as its hybrid
+    participant. The participant owns no projection: it only reads what the
+    channel indexes maintain.
+    """
+
+    capabilities: MemoryCapabilities
+
+    async def initialize(self, connection: AsyncConnection, /) -> None: ...
+
+    async def search(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels: ...
+
+
 class NoMemoryIndex:
     """Truthfully expose an authoritative store without search projections."""
 
@@ -189,8 +211,9 @@ class NoMemoryIndex:
 class CompositeMemoryIndex:
     """Combine independent search indexes without leaking them into repositories."""
 
-    def __init__(self, *indexes: MemoryIndex) -> None:
+    def __init__(self, *indexes: MemoryIndex, hybrid: HybridMemoryIndex | None = None) -> None:
         self.indexes = indexes
+        self._hybrid = hybrid
         fts = any(index.capabilities.fts for index in indexes)
         vector_indexes = tuple(index for index in indexes if index.capabilities.vector)
         profile = vector_indexes[0].capabilities.embedding_profile if vector_indexes else None
@@ -206,6 +229,8 @@ class CompositeMemoryIndex:
     async def initialize(self, connection: AsyncConnection, /) -> None:
         for index in self.indexes:
             await index.initialize(connection)
+        if self._hybrid is not None:
+            await self._hybrid.initialize(connection)
 
     async def replace(
         self,
@@ -247,6 +272,10 @@ class CompositeMemoryIndex:
         request: MemorySearchRequest,
         /,
     ) -> MemorySearchChannels:
+        if request.mode == "hybrid" and self._hybrid is not None:
+            # The hybrid participant reads both indexes in one statement, so the
+            # channel indexes must not add a second candidate query for it.
+            return await self._hybrid.search(connection, scope_id, request)
         fts: tuple[MemoryChannelHit, ...] = ()
         vector: tuple[MemoryChannelHit, ...] = ()
         for index in self.indexes:

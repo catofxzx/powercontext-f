@@ -16,6 +16,9 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
+from typing import Any
+
 from pyobvector import VECTOR, VectorIndex
 from sqlalchemy import (
     BigInteger,
@@ -96,6 +99,67 @@ WHERE m.scope_id = :scope_id
   AND m.memory_artifact_id IN :memory_artifact_ids
 ORDER BY l2_distance(m.embedding, :query_vector) APPROXIMATE
 LIMIT :candidate_limit
+"""
+
+
+def _hybrid_search_sql(*, tagged: bool) -> str:
+    """One compound statement that reads the full-text and the vector index.
+
+    The full-text branch ranks the active-head projection by its MATCH score and
+    the vector branch ranks the embedding projection by its L2 distance. Each
+    branch keeps its own index, its own filters and its own candidate limit, so
+    a hybrid candidate query costs one statement instead of two.
+    """
+
+    fts_tag = memory_tag_sql("h") if tagged else ""
+    vector_tag = memory_tag_sql("m") if tagged else ""
+    # A tag filter has to narrow the candidates before the limit, so the vector
+    # branch gives up the approximate top-k and ranks the exact distance.
+    approximate = "" if tagged else " APPROXIMATE"
+    return f"""
+(
+    SELECT
+        h.memory_artifact_id,
+        h.head_revision,
+        h.entry_id,
+        h.entry_version_id,
+        v.text,
+        NULL AS distance,
+        'fts' AS channel
+    FROM pc_memory_entry_heads AS h
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = h.scope_id
+     AND v.memory_artifact_id = h.memory_artifact_id
+     AND v.entry_version_id = h.entry_version_id
+    WHERE h.scope_id = :scope_id
+      AND h.memory_artifact_id IN :memory_artifact_ids
+      AND MATCH(h.searchable_text) AGAINST (:analyzed_query){fts_tag}
+    ORDER BY MATCH(h.searchable_text) AGAINST (:analyzed_query) DESC,
+             h.memory_artifact_id,
+             h.entry_id,
+             h.entry_version_id
+    LIMIT :candidate_limit
+)
+UNION ALL
+(
+    SELECT
+        m.memory_artifact_id,
+        m.head_revision,
+        m.entry_id,
+        m.entry_version_id,
+        v.text,
+        l2_distance(m.embedding, :query_vector) AS distance,
+        'vector' AS channel
+    FROM pc_memory_vector_entries AS m
+    JOIN pc_memory_entry_versions AS v
+      ON v.scope_id = m.scope_id
+     AND v.memory_artifact_id = m.memory_artifact_id
+     AND v.entry_version_id = m.entry_version_id
+    WHERE m.scope_id = :scope_id
+      AND m.memory_artifact_id IN :memory_artifact_ids{vector_tag}
+    ORDER BY l2_distance(m.embedding, :query_vector){approximate}
+    LIMIT :candidate_limit
+)
 """
 
 
@@ -493,6 +557,82 @@ class OceanBaseMemoryVectorIndex:
                 )
             )
         return tuple(hydrated)
+
+
+class OceanBaseMemoryHybridIndex:
+    """One statement that returns the candidates of both search channels.
+
+    The full-text branch reads the FULLTEXT index over the active-head projection
+    and the vector branch reads the HNSW index over the embedding projection, so a
+    hybrid candidate query costs one statement instead of two. The class owns no
+    projection: the channel indexes maintain the rows it reads.
+    """
+
+    def __init__(self, vector_index: OceanBaseMemoryVectorIndex) -> None:
+        self._vector_index = vector_index
+        self.profile = vector_index.profile
+        self.capabilities = MemoryCapabilities(
+            fts=True,
+            vector=True,
+            hybrid=True,
+            tag_filter=True,
+            embedding_profile=self.profile,
+        )
+        self._search_sql = text(_hybrid_search_sql(tagged=False)).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("query_vector", type_=VECTOR(self.profile.dimension)),
+        )
+        self._tagged_search_sql = text(_hybrid_search_sql(tagged=True)).bindparams(
+            bindparam("memory_artifact_ids", expanding=True),
+            bindparam("tag_keys", expanding=True),
+            bindparam("tag_hashes", expanding=True),
+            bindparam("query_vector", type_=VECTOR(self.profile.dimension)),
+        )
+
+    async def initialize(self, connection: AsyncConnection, /) -> None:
+        # The FULLTEXT and the vector index belong to the channel indexes.
+        del connection
+
+    async def search(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        request: MemorySearchRequest,
+        /,
+    ) -> MemorySearchChannels:
+        if request.mode != "hybrid":
+            return MemorySearchChannels()
+        if request.embedding_profile != self.profile or request.query_vector is None:
+            raise CapabilityNotSupportedError("embedding-profile")
+        if not await self._vector_index.vector_complete(connection, scope_id, request.memories, self.profile):
+            raise CapabilityNotSupportedError("vector")
+        rows = (
+            await connection.execute(
+                self._search_sql if request.tag_filter is None else self._tagged_search_sql,
+                {
+                    "scope_id": scope_id,
+                    "memory_artifact_ids": tuple(memory.artifact_id for memory in request.memories),
+                    "analyzed_query": request.analyzed_query,
+                    "query_vector": validate_embedding(
+                        request.query_vector,
+                        dimension=self.profile.dimension,
+                    ),
+                    "candidate_limit": request.candidate_limit,
+                    **memory_tag_parameters(request.tag_filter),
+                },
+            )
+        ).mappings()
+        fts_rows: list[Mapping[Any, Any]] = []
+        vector_rows: list[Mapping[Any, Any]] = []
+        for row in rows:
+            if str(row["channel"]) == "fts":
+                fts_rows.append(row)
+            else:
+                vector_rows.append(row)
+        return MemorySearchChannels(
+            fts=memory_channel_hits(fts_rows, request.memories),
+            vector=memory_channel_hits(vector_rows, request.memories),
+        )
 
 
 def _embedding_hash(profile: EmbeddingProfile, entry_hash: str) -> str:

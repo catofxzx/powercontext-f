@@ -254,6 +254,34 @@ class ArtifactProcessingIntentRepository:
         )
         return cast(StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name))
 
+    async def admit_pending(
+        self, connection: AsyncConnection, scope_id: str, binding_name: str, /
+    ) -> StoredArtifactProcessingIntent:
+        """Accept one scope's pending domain work outside a scheduled scan.
+
+        A count trigger admits a scope as soon as its pending Source count
+        reaches the configured threshold, so no frozen scan exists. The
+        acceptance rule stays identical to a scheduled admission: an accepted
+        request is never accepted twice, and work without a pending domain
+        generation is not accepted at all.
+        """
+
+        _require_key(scope_id, binding_name)
+        current = await self.load(connection, scope_id, binding_name, for_update=True)
+        if current is None:
+            raise InvalidRepositoryArgumentError("scope_id", "pending member is not registered")
+        if current.requested_generation != current.handled_generation:
+            return current
+        if current.dirty_generation <= current.clean_generation:
+            return current
+        table = ARTIFACT_PROCESSING_INTENTS_TABLE
+        await connection.execute(
+            update(table)
+            .where(table.c.scope_id == scope_id, table.c.binding_name == binding_name)
+            .values(requested_generation=current.requested_generation + 1)
+        )
+        return cast(StoredArtifactProcessingIntent, await self.load(connection, scope_id, binding_name))
+
 
 def _require_key(scope_id: str, binding_name: str) -> None:
     _require_identifier("scope_id", scope_id, MAX_SCOPE_ID_LENGTH)

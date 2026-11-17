@@ -85,6 +85,7 @@ from powercontext.builtin.persistence.memory_index import CompositeMemoryIndex, 
 from powercontext.builtin.persistence.oceanbase.experience_index import OceanBaseExperienceFTSIndex
 from powercontext.builtin.persistence.oceanbase.memory_index import (
     OceanBaseMemoryFTSIndex,
+    OceanBaseMemoryHybridIndex,
     OceanBaseMemoryVectorIndex,
 )
 from powercontext.builtin.persistence.oceanbase.profile import OceanBaseConfig, OceanBaseProfile
@@ -109,6 +110,7 @@ from powercontext.builtin.persistence.sqlite.topic_memory_index import (
 from powercontext.builtin.persistence.tables import BUILTIN_TABLES
 from powercontext.builtin.persistence.tag_schema import ensure_topic_memory_tag_schema
 from powercontext.builtin.persistence.topic_memory import TopicMemoryRepository
+from powercontext.builtin.persistence.topic_memory_schema import ensure_topic_memory_lifecycle_schema
 from powercontext.builtin.persistence.topic_memory_index import (
     CompositeTopicMemoryIndex,
     TopicMemoryIndex,
@@ -156,6 +158,7 @@ from powercontext.builtin.runtime.readiness import (
 )
 from powercontext.builtin.runtime.recall_sufficiency import RecallSufficiencyPolicy
 from powercontext.builtin.runtime.relational import RelationalContexts
+from powercontext.builtin.runtime.source_lifecycle import SourceLifecycleService
 from powercontext.builtin.runtime.topic_memory_processing import (
     TopicMemoryWorkerSpec,
     run_topic_memory_worker,
@@ -651,6 +654,10 @@ async def open_builtin_runtime(
                 scheduled_source_runner=scheduled_source_runner,
                 scheduled_experience_runner=scheduled_experience_runner,
                 remote_ingestion=contexts,
+                source_lifecycle=SourceLifecycleService(
+                    database=contexts.database,
+                    topics=contexts.repositories.topic_memories,
+                ),
             )
         )
         runtime.artifact_processing_supervisor = await resources.enter_async_context(
@@ -771,6 +778,13 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
             entrypoint = partial(run_family_worker, FamilyWorkerSpec(config=config, worker_security=worker_security))
         interval = None if family == "profile" else automatic[family]
         binding = canonical[family]
+        count_threshold = {
+            "memory": config.runtime.memory_source_count_threshold,
+            "topic-memory": config.runtime.topic_memory_source_count_threshold,
+        }.get(family)
+        pending_provider = (
+            None if family == "skill" else SourceProcessingPendingProvider(contexts.database, binding, family)
+        )
         configured.append(
             ArtifactProcessingBinding(
                 binding_name=binding,
@@ -783,10 +797,10 @@ def _artifact_processing_bindings(  # noqa: C901 - validate and assemble one reg
                 if family == "profile" and config.runtime.profile_schedule_enabled
                 else None,
                 timezone=config.runtime.profile_timezone if family == "profile" else "Asia/Shanghai",
-                pending_provider=None
-                if family == "skill"
-                else SourceProcessingPendingProvider(contexts.database, binding, family),
+                pending_provider=pending_provider,
                 automatic_scope_filter=enabled_profile_scopes if family == "profile" else None,
+                source_count_threshold=count_threshold,
+                source_count_provider=pending_provider if count_threshold is not None else None,
             )
         )
     _validate_processing_registrations(configured)
@@ -902,6 +916,7 @@ async def open_builtin_contexts(
                 await ensure_topic_memory_tag_schema(connection)
                 await ensure_dream_schema(connection)
                 await ensure_scope_search_schema(connection)
+                await ensure_topic_memory_lifecycle_schema(connection)
                 # A Topic child reuses its parent's schema. It never reads or
                 # writes Memory/Experience projections; rebuilding their FTS
                 # indexes here would take the shared SQLite write lock once
@@ -961,9 +976,13 @@ async def open_builtin_contexts(
         return
     experience_index = OceanBaseExperienceFTSIndex()
     indexes = [OceanBaseMemoryFTSIndex()]
+    hybrid_index: OceanBaseMemoryHybridIndex | None = None
     if embedding_model is not None:
-        indexes.append(OceanBaseMemoryVectorIndex(embedding_model.profile))
-    index = CompositeMemoryIndex(*indexes)
+        vector_index = OceanBaseMemoryVectorIndex(embedding_model.profile)
+        indexes.append(vector_index)
+        # One statement serves both channels of a hybrid candidate query.
+        hybrid_index = OceanBaseMemoryHybridIndex(vector_index)
+    index = CompositeMemoryIndex(*indexes, hybrid=hybrid_index)
     topic_indexes: list[TopicMemoryIndex] = [OceanBaseTopicMemoryFTSIndex()]
     if embedding_model is not None:
         topic_indexes.append(OceanBaseTopicMemoryVectorIndex(embedding_model.profile))
@@ -983,6 +1002,7 @@ async def open_builtin_contexts(
             await ensure_topic_memory_tag_schema(connection)
             await ensure_dream_schema(connection)
             await ensure_scope_search_schema(connection)
+            await ensure_topic_memory_lifecycle_schema(connection)
             if not _topic_memory_worker:
                 await index.initialize(connection)
                 await experience_index.initialize(connection)

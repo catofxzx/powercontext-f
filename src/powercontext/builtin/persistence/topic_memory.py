@@ -17,6 +17,7 @@
 from __future__ import annotations
 
 from datetime import UTC, datetime
+from typing import Literal
 
 from sqlalchemy import and_, delete, func, insert, or_, select, update
 from sqlalchemy.dialects.mysql import insert as mysql_insert
@@ -379,6 +380,7 @@ class TopicMemoryRepository:
             .where(
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
                 TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.family == TopicMemory.family,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.lifecycle_state == "active",
             )
         )
         if tag_filter is not None:
@@ -501,6 +503,52 @@ class TopicMemoryRepository:
             ),
         )
 
+    async def withdraw_topic(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        ref: ArtifactRef,
+        /,
+    ) -> None:
+        """Leave the searchable channels without touching the immutable Revision."""
+
+        await self._set_lifecycle_state(connection, scope_id, ref, "inactive")
+        await self.index.withdraw(connection, scope_id, ref)
+
+    async def restore_topic(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        ref: ArtifactRef,
+        /,
+    ) -> None:
+        """Return a withdrawn Topic to the searchable channels."""
+
+        await self._set_lifecycle_state(connection, scope_id, ref, "active")
+        await self.index.restore(connection, scope_id, ref)
+
+    async def _set_lifecycle_state(
+        self,
+        connection: AsyncConnection,
+        scope_id: str,
+        ref: ArtifactRef,
+        state: Literal["active", "inactive"],
+        /,
+    ) -> None:
+        if ref.family != TopicMemory.family:
+            raise InvalidRepositoryArgumentError("artifact_ref", "must reference topic-memory")
+        result = await connection.execute(
+            update(TOPIC_MEMORY_ACTIVE_TOPICS_TABLE)
+            .where(
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.scope_id == scope_id,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.family == TopicMemory.family,
+                TOPIC_MEMORY_ACTIVE_TOPICS_TABLE.c.artifact_id == ref.artifact_id,
+            )
+            .values(lifecycle_state=state)
+        )
+        if result.rowcount != 1:
+            raise TopicMemoryStorageInvariantError("missing-active-head", (scope_id, ref))
+
     async def _activate(
         self,
         connection: AsyncConnection,
@@ -542,6 +590,7 @@ class TopicMemoryRepository:
                 summary=topic.content.summary,
                 searchable_text=projection.topic_searchable_text,
                 source_count=len(topic.lineage.sources),
+                lifecycle_state="active",
             )
         )
         await connection.execute(
