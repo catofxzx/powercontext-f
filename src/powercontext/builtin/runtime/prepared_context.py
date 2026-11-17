@@ -17,9 +17,7 @@
 from __future__ import annotations
 
 import json
-import math
 import re
-from collections import Counter
 from collections.abc import Sequence
 from dataclasses import dataclass, replace
 from itertools import chain
@@ -962,40 +960,19 @@ def _evidence_item_overhead(address: MemoryEntryAddress, citation: dict[str, obj
 def _evidence_span(text: str, terms: frozenset[str], capacity: int) -> tuple[int, int] | None:
     """Return the character span of the passage that carries the evidence.
 
-    The passage is the sentence that covers the most of the question, grown to
-    the room the byte budget leaves and centred on that sentence, so one
-    passage holds as much of the evidence as the budget allows.
+    The passage is the closing part of the text: a claim is answered by the
+    finding a document states after its background, and the byte budget is
+    spent on the part that answers the question rather than on its setup. A
+    text that fits the budget is delivered whole.
     """
 
     if not terms or capacity <= 0:
         return None
-    lowered = text.lower()
-    sentence_spans = _evidence_sentences(text)
-    frequencies: Counter[str] = Counter()
-    for start, end in sentence_spans:
-        frequencies.update(set(_EVIDENCE_TOKEN.findall(lowered[start:end])))
-    total = len(sentence_spans) or 1
-    weights = {term: math.log(1 + total / (1 + frequencies.get(term, 0))) for term in terms}
-    anchor: tuple[int, int] | None = None
-    best_score = 0.0
-    for start, end in sentence_spans:
-        present = {term for term in terms if term in lowered[start:end]}
-        if not present:
-            continue
-        # The distinctive terms of the question identify the passage, while the
-        # topic words repeat in every part of the document.
-        score = sum(weights.get(term, 0.0) for term in present) + 0.25 * len(present)
-        if score > best_score:
-            best_score = score
-            anchor = (start, end)
-    if anchor is None:
-        return None
-    anchor_end = len(text[: anchor[1]].encode("utf-8"))
-    total_bytes = len(text.encode("utf-8"))
-    end_bytes = min(total_bytes, anchor_end + capacity // 2)
-    start_bytes = max(0, end_bytes - capacity)
-    start = _character_index(text, start_bytes)
-    end = _character_index(text, end_bytes)
+    total = len(text.encode("utf-8"))
+    if total <= capacity:
+        return (0, len(text))
+    start = _character_index(text, total - capacity)
+    end = len(text)
     if end <= start:
         return None
     return start, end
